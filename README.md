@@ -1,0 +1,53 @@
+# xprobe
+
+Distributed availability monitoring for [Remnawave](https://remna.st)
+deployments: lightweight probes at many vantage points, one control plane.
+
+Every probe brings each subscription config up with a **real `xray` binary**
+(pinned to your node version — no silent XHTTP incompatibilities), verifies
+the **exit address** (a dead WARP masked by a DIRECT fallback stays invisible
+to ordinary checkers), and reports **at which stage** a config broke: network,
+TLS handshake, protocol, or bandwidth.
+
+The control plane makes the fleet manageable: which probe checks which
+servers, in which modes, at what intervals — all edited centrally, applied to
+probes automatically.
+
+## Components
+
+| Directory | What it is | Image |
+|---|---|---|
+| [`agent/`](agent) | the probe: one Python file + an xray binary | `ghcr.io/nd4y/xprobe` |
+| [`control/`](control) | the control plane: FastAPI + sqlite, talks to the Remnawave panel | `ghcr.io/nd4y/xprobe-control` |
+| [`deploy/`](deploy) | ready-to-use compose files for both | — |
+
+## Zero-touch vantage points
+
+A new vantage point needs **two environment lines** — `CONTROL_URL` and
+`ENROLL_TOKEN` — and `docker compose up -d`. The probe enrolls itself,
+receives its identity and target set, detects its own city/ISP, and starts
+pushing metrics through the control-plane relay. Everything else is managed
+from the control-plane UI.
+
+## Security model
+
+* The control plane serves **two ports**: a public one for probes
+  (`/api/points/*`, `/api/enroll` — per-point secrets) and an internal one for
+  the admin UI (local account, HTTP Basic). The public port has no admin
+  routes at all.
+* Point secrets are stored hashed; each point can only fetch its own document
+  and push its own metrics.
+* Probes never learn the metrics store's address or credentials — metrics go
+  through the control-plane relay with the same per-point secret.
+* A vantage node's IP is stored for diagnostics but never exposed — not in
+  documents, not in the UI, not in metric labels.
+
+## Development
+
+```bash
+cd control
+python -m pytest -q     # tests (require fastapi + httpx + uvicorn)
+ruff check . ../agent
+```
+
+CI builds and publishes both images on every push to `main`.

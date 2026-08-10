@@ -1,0 +1,54 @@
+# Probe control plane.
+#
+# Two ports with different trust boundaries:
+#   8080 (points) — /api/points/*, /api/enroll. Publish this one to the
+#        internet through your reverse proxy: probes call it, authenticating
+#        with point secrets / the enroll token. There are no admin routes on
+#        this port at all.
+#   8081 (admin)  — the UI and /api/admin/*. Internal only: publish it
+#        separately on an internal proxy. Sign-in is the local account
+#        (XPC_ADMIN_USER/XPC_ADMIN_PASSWORD, HTTP Basic).
+#
+# Metrics from points arrive here and are forwarded to the metrics store
+# (XPC_RELAY_WRITE_URL) — probes never learn the store's address.
+
+services:
+  xprobe-control:
+    image: ghcr.io/nd4y/xprobe-control:latest
+    container_name: xprobe-control
+    restart: unless-stopped
+    environment:
+      # Remnawave panel API.
+      XPC_PANEL_URL: "${XPC_PANEL_URL:?set XPC_PANEL_URL}"
+      XPC_PANEL_TOKEN: "${XPC_PANEL_TOKEN:?set XPC_PANEL_TOKEN}"
+      XPC_SESSION_SECRET: "${XPC_SESSION_SECRET:?set XPC_SESSION_SECRET}"
+      # Local admin account — the primary sign-in mode.
+      XPC_ADMIN_USER: "${XPC_ADMIN_USER:?set XPC_ADMIN_USER}"
+      XPC_ADMIN_PASSWORD: "${XPC_ADMIN_PASSWORD:?set XPC_ADMIN_PASSWORD}"
+      # Public URL of the POINTS side — it goes into probe documents and the
+      # operator's .env, so it must be the externally reachable name.
+      XPC_BASE_URL: "${XPC_BASE_URL:?set XPC_BASE_URL}"
+      XPC_DB_PATH: "/data/xprobe-control.sqlite3"
+      # Relay: points push metrics here, the service forwards them to the
+      # store (VictoriaMetrics /api/v1/import/prometheus or compatible).
+      XPC_RELAY_WRITE_URL: "${XPC_RELAY_WRITE_URL:?set XPC_RELAY_WRITE_URL}"
+      # Default target set for auto-enrolled points (panel host remarks,
+      # comma separated), until the administrator assigns one.
+      XPC_DEFAULT_CHECK_REMARKS: "${XPC_DEFAULT_CHECK_REMARKS:-}"
+      XPC_DEFAULT_LOAD_REMARKS: "${XPC_DEFAULT_LOAD_REMARKS:-}"
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      # sqlite lives here. Create the directory beforehand: Docker creates a
+      # directory in place of a missing file, and sqlite then fails to open.
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz'); urllib.request.urlopen('http://127.0.0.1:8081/healthz')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

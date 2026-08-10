@@ -1,0 +1,9 @@
+# The probe is a single file with no external dependencies (besides the xray
+# binary). This config exists only to keep the style uniform with the rest of
+# the codebase.
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

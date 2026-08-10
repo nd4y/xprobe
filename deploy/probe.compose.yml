@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# xprobe vantage point. One file for every point — zero-touch or explicit.
+#
+# THE POINT OPERATOR CONFIGURES NOTHING. Bringing this compose up is enough:
+# the probe registers with the control plane using the enroll token, receives
+# its name, target set and secret, detects its own city/ISP/address and starts
+# pushing metrics. Everything else — which servers to check and how often —
+# is managed centrally in the control-plane UI.
+#
+#   docker compose -f probe.compose.yml up -d
+#
+# .env (handed out together with this file; nothing else to touch):
+#   CONTROL_URL=https://<control-url>
+#   ENROLL_TOKEN=<current enroll token>
+#
+# Metrics go TO THE CONTROL PLANE (relayed), not directly to a store: the
+# point knows neither the store's address nor a separate password for it —
+# only CONTROL_URL and a token that is no longer needed after the first run
+# (the probe lives on the issued secret from the volume).
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+  xprobe:
+    image: ghcr.io/nd4y/xprobe:latest
+    container_name: xprobe
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      CONTROL_URL: "${CONTROL_URL:?set CONTROL_URL}"
+      # Two ways to identify to the control plane; exactly one is needed:
+      #   ENROLL_TOKEN        — zero-touch: exchanged for a permanent identity
+      #                         on first start, unused afterwards;
+      #   POINT+CONTROL_TOKEN — the point was provisioned in the control
+      #                         plane beforehand.
+      ENROLL_TOKEN: "${ENROLL_TOKEN:-}"
+      POINT: "${POINT:-}"
+      CONTROL_TOKEN: "${CONTROL_TOKEN:-}"
+      # How often to check the config version against the control plane. A
+      # version change = a clean restart with the new settings.
+      CONTROL_INTERVAL: "60"
+    volumes:
+      # The point's identity (node-id + issued secret), config cache and
+      # metrics spool. Survives restarts: without the volume the node would
+      # enroll itself with the control plane anew on every start.
+      - xprobe-data:/var/lib/xprobe
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    mem_limit: 1g
+    mem_reservation: 128m
+
+volumes:
+  xprobe-data:

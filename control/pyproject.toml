@@ -1,0 +1,31 @@
+[project]
+name = "xprobe-control"
+version = "0.1.0"
+description = "Centralized management for a fleet of xprobe probes"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Depends()/Cookie() in a handler signature is FastAPI's way of declaring a
+# dependency, not an accidental call in a default value (B008).
+"control/app.py" = ["B008"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
