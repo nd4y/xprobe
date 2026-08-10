@@ -84,6 +84,27 @@ edited centrally:
 | `CONTROL_URL` | control-plane address |
 | `CONTROL_TOKEN` | the point's secret: metrics are pushed with it too |
 | `CONTROL_INTERVAL` | how often to check the document version (60 s) |
+| `ENROLL_TOKEN` | zero-touch alternative to POINT+CONTROL_TOKEN |
+| `NODE_ID` | stable node identity for enrolment — see below |
+
+## Restarts, and storage that does not survive them
+
+With `POINT` + `CONTROL_TOKEN` the identity is in the environment, so the
+probe reconnects with **nothing persisted at all**: the volume then holds only
+the metrics spool and the document cache, and losing them costs undelivered
+samples and one extra fetch.
+
+Enrolment is different. The control plane recognises a returning node by its
+`NODE_ID`, so that value has to survive a restart — otherwise each restart
+enrols a **brand new point**, and the fleet grows a duplicate (plus a panel
+account) every time. By default the id is generated once and kept in the
+volume, which is enough for Docker.
+
+On Kubernetes an `emptyDir` disappears when the pod is rescheduled, so pin the
+id instead: run a StatefulSet and take `NODE_ID` from the pod name via the
+downward API. The name is stable, re-enrolment returns the same point, and no
+storage is needed. The control plane's enrol dialog hands out exactly that
+manifest.
 
 Configs come from the control plane too, already filtered to this point's
 target set, and are **held in memory only** — they carry working credentials

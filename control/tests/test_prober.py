@@ -54,6 +54,23 @@ def test_enabled_mode_without_a_config_source_is_an_error():
         prober.Config.from_document(bad, point="p", push_password="t")
 
 
+def test_node_id_prefers_the_environment(monkeypatch, tmp_path):
+    # The only identity that survives storage which does not: without it a
+    # rescheduled pod enrolls as a new point.
+    monkeypatch.setenv("NODE_ID", "pinned-by-the-orchestrator")
+    monkeypatch.setattr(prober, "NODE_ID_PATH", str(tmp_path / "node-id"))
+    assert prober.node_id() == "pinned-by-the-orchestrator"
+    # And nothing is written: the environment is the source of truth here.
+    assert not (tmp_path / "node-id").exists()
+
+
+def test_node_id_falls_back_to_the_volume(monkeypatch, tmp_path):
+    monkeypatch.delenv("NODE_ID", raising=False)
+    monkeypatch.setattr(prober, "NODE_ID_PATH", str(tmp_path / "node-id"))
+    first = prober.node_id()
+    assert first and prober.node_id() == first     # stable across calls
+
+
 def test_timing_camouflage_reaches_the_probes():
     # Without jitter and spread a round is a burst of handshakes on the dot,
     # in a fixed order — the clearest machine signature the probe emits.

@@ -453,6 +453,17 @@ def test_token_rotation_revokes_the_old_one(tmp_path):
     assert points.post("/api/enroll", json={"token": new, "node_id": "n"}).status_code == 200
 
 
+def test_enroll_manifest_pins_a_stable_node_id(tmp_path):
+    # Enrolment identifies a node by NODE_ID. On ephemeral storage a random
+    # one would enroll a brand new point every restart, so the manifest takes
+    # it from the pod name and uses a StatefulSet to keep that name stable.
+    _, admin, _ = build(tmp_path)
+    manifest = admin.get("/api/admin/enroll-token", cookies=owner_cookie()).json()["kubectl"]
+    assert "kind: StatefulSet" in manifest
+    assert "name: NODE_ID" in manifest
+    assert "fieldPath: metadata.name" in manifest
+
+
 def test_enroll_token_response_carries_the_public_url(tmp_path):
     # The admin UI runs on another host, so its own origin would be wrong in
     # the operator's .env — the public points URL comes from the backend.
