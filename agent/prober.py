@@ -928,11 +928,23 @@ def watch_control(control_url: str, point: str, token: str, current: int,
 
 
 def node_id() -> str:
-    """The node's permanent identity: generated once, lives in the volume.
+    """The node's permanent identity, used only when enrolling.
 
-    The control plane uses it to recognize a returning node (lost identity
-    file) and hand back the same point instead of creating a new one.
+    The control plane recognises a returning node by it and hands back the
+    same point instead of creating a new one — so this value MUST be stable
+    across restarts, or every restart enrolls a brand new point and litters
+    the fleet.
+
+    Order: an explicit `NODE_ID` from the environment, then the volume, then a
+    fresh random one. The environment comes first because it is the only
+    option that survives storage which does not: on Kubernetes an emptyDir
+    disappears when the pod is rescheduled, and pinning NODE_ID (from the pod
+    name via the downward API, say) makes enrolment work with no persistence
+    at all.
     """
+    fixed = env("NODE_ID")
+    if fixed:
+        return fixed
     try:
         with open(NODE_ID_PATH, encoding="utf-8") as f:
             nid = f.read().strip()
@@ -947,7 +959,10 @@ def node_id() -> str:
         with open(NODE_ID_PATH, "w", encoding="utf-8") as f:
             f.write(nid)
     except OSError as exc:
-        print(f"node-id not saved (a new one will be generated on restart): {exc}", flush=True)
+        # Without a stable id every restart becomes a new point. Say so
+        # plainly rather than letting the fleet grow a duplicate per restart.
+        print(f"node-id NOT persisted ({exc}) — set NODE_ID to a stable value, "
+              f"or this node will enroll as a NEW point on every restart", flush=True)
     return nid
 
 

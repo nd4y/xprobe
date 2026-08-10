@@ -375,7 +375,7 @@ async function pointView(name) {
 // per node and rotatable — regenerating revokes the old token while
 // already-enrolled nodes are unaffected.
 async function showEnroll() {
-  const { token, control_url: controlUrl } = await api('/admin/enroll-token');
+  const { token, control_url: controlUrl, kubectl } = await api('/admin/enroll-token');
   const env = [
     `CONTROL_URL=${controlUrl || location.origin}`,
     `ENROLL_TOKEN=${token}`,
@@ -393,6 +393,7 @@ async function showEnroll() {
   dialog('Node enroll token', [
     el('p', { class: 'muted' }, 'The point operator puts this into .env next to the compose file — nothing else. The node connects and determines its location by itself.'),
     el('div', { class: 'secret' }, env),
+    kubectl ? cmdBlock('kubernetes (identity survives rescheduling, no storage needed)', kubectl) : null,
   ], [rotate, copy]);
 }
 

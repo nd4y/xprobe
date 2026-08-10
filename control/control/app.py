@@ -446,7 +446,8 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
     def show_token(_: dict = Depends(require_owner)) -> dict:
         # control_url is the PUBLIC points URL: the admin UI runs on another
         # host, so its own origin would be wrong in the operator's .env.
-        return {"token": _enroll_token(), "control_url": cfg.base_url}
+        return {"token": _enroll_token(), "control_url": cfg.base_url,
+                "kubectl": _enroll_manifest(_enroll_token())}
 
     @admin.post("/api/admin/enroll-token/rotate")
     def rotate_token(_: dict = Depends(require_owner)) -> dict:
@@ -583,6 +584,46 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             "status": http,
             "download": _squad_remarks(p.load_squad),
         }
+
+    def _enroll_manifest(token: str) -> str:
+        """Zero-touch on Kubernetes, with nothing persisted.
+
+        A StatefulSet rather than a Deployment, and NODE_ID taken from the pod
+        name: enrolment identifies a node by NODE_ID, so it has to survive a
+        restart. An emptyDir does not survive rescheduling, and a random id
+        would enroll a brand new point every time the pod moved. A
+        StatefulSet's pod name is stable, so re-enrolment returns the same
+        point and the fleet stays the size it should be.
+        """
+        url = cfg.base_url or "https://<control-url>"
+        return f"""cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: xprobe
+spec:
+  serviceName: xprobe
+  replicas: 1
+  selector: {{ matchLabels: {{ app: xprobe }} }}
+  template:
+    metadata: {{ labels: {{ app: xprobe }} }}
+    spec:
+      containers:
+        - name: xprobe
+          image: ghcr.io/nd4y/xprobe:latest
+          env:
+            - {{ name: CONTROL_URL, value: "{url}" }}
+            - {{ name: ENROLL_TOKEN, value: "{token}" }}
+            # Stable across restarts and rescheduling — this is what keeps
+            # the node one point instead of a new one each time.
+            - name: NODE_ID
+              valueFrom: {{ fieldRef: {{ fieldPath: metadata.name }} }}
+          volumeMounts:
+            - {{ name: data, mountPath: /var/lib/xprobe }}
+      volumes:
+        - name: data
+          emptyDir: {{}}
+EOF"""
 
     def _install_commands(name: str, secret: str) -> dict[str, str]:
         """Ready-to-paste run commands for the point, docker and kubernetes."""

@@ -71,6 +71,12 @@ it in the UI revokes the old one, while already-connected nodes are unaffected
 (they authenticate with their secrets). If a node loses its volume, re-enroll
 with the same `node_id` returns the same point with a fresh secret.
 
+That last sentence is the whole reason `node_id` must be stable: a node whose
+id changes enrols as a **new point** every restart. The enrol dialog therefore
+also hands out a Kubernetes manifest that pins it — a StatefulSet taking
+`NODE_ID` from the pod name — so enrolment works on ephemeral storage without
+growing a duplicate point per rescheduling.
+
 **City and ISP are visible in the UI; the node's address is not.** The probe
 sets the `city`/`isp` labels itself and refreshes them on the fly if the
 address changes without a restart; the `ip` is stored in the control plane for
