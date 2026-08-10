@@ -302,6 +302,12 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
                       city=str(payload.get("city") or ""),
                       isp=str(payload.get("isp") or ""),
                       ip=str(payload.get("ip") or ""))
+        versions = payload.get("xray_versions")
+        if isinstance(versions, list):
+            # The image decides which cores exist; the control plane only
+            # learns about them, so it can warn before a check is pointed at
+            # one this node does not carry.
+            db.update_xray_versions(deps.conn, p.name, [str(v) for v in versions])
         return {"ok": True}
 
     # ── metrics relay ───────────────────────────────────────────────────────

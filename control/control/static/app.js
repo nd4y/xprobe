@@ -207,6 +207,14 @@ async function pointView(name) {
 
   // — checks —
   const modeBoxes = {}; const intBoxes = {};
+  // Which cores this node carries, as the probe reported them, and any check
+  // pointed at one it does not have.
+  const avail = p.xray_versions || [];
+  const coreBoxes = {};
+  const badCores = MODES.filter((m) => m !== 'tcp')
+    .map((m) => (p.cores && p.cores[m]) || '')
+    .filter((v) => v && avail.length && !avail.includes(v));
+
   // Volume tolerance: the download check proves how much gets through before
   // the tunnel is cut, so both the source file and the volume are per point.
   const dlUrl = el('input', { value: p.download_url || '', placeholder: 'default source' });
@@ -224,14 +232,38 @@ async function pointView(name) {
       const iv = el('input', { type: 'number', min: '10', step: '10',
         value: String((p.intervals && p.intervals[m]) || DEF_INT[m]) });
       modeBoxes[m] = sw.input; intBoxes[m] = iv;
-      return el('div', { class: 'check-row' }, [
+      const row = [
         sw,
         el('span', { class: 'name' }, MODE_LABEL[m]),
         el('span', { class: 'muted grow' }, MODE_HINT[m]),
         el('span', { class: 'every' }, [el('span', { class: 'muted' }, 'every'), iv,
           el('span', { class: 'muted' }, 's')]),
-      ]);
+      ];
+      // tcp opens a socket and a TLS handshake itself — no core is involved,
+      // so offering it a core version would be a lie.
+      if (m !== 'tcp') {
+        const cur = (p.cores && p.cores[m]) || '';
+        const opts = [el('option', { value: '' }, 'image default')];
+        for (const v of avail) {
+          opts.push(el('option', { value: v, ...(cur === v ? { selected: '' } : {}) }, v));
+        }
+        if (cur && !avail.includes(cur)) {
+          opts.push(el('option', { value: cur, selected: '' }, `${cur} — not on this node`));
+        }
+        const sel = el('select', {}, opts);
+        coreBoxes[m] = sel;
+        row.push(el('span', { class: 'every' }, [el('span', { class: 'muted' }, 'core'), sel]));
+      }
+      return el('div', { class: 'check-row' }, row);
     }),
+    el('div', { class: 'muted' }, avail.length
+      ? `Cores this node carries: ${avail.join(', ')}.`
+      : 'This node has not reported which cores it carries yet.'),
+    ...(badCores.length ? [el('div', { class: 'warn' }, [
+      el('b', {}, 'A check is set to a core this node does not have: '),
+      badCores.join(', '),
+      el('div', { class: 'muted' }, 'That check cannot run at all — the probe refuses to substitute another core, because an answer from the wrong version is worse than no answer.'),
+    ])] : []),
     el('div', { class: 'grid' }, [
       el('label', { class: 'field' }, [el('span', {}, 'volume to push, MiB'), dlMiB]),
       el('label', { class: 'field' }, [el('span', {}, 'volume test source'), dlUrl]),
@@ -348,6 +380,8 @@ async function pointView(name) {
           pin_geo: pinGeo.input.checked, enabled: enabled.input.checked,
           modes: Object.fromEntries(MODES.map((m) => [m, modeBoxes[m].checked])),
           intervals: Object.fromEntries(MODES.map((m) => [m, Number(intBoxes[m].value) || 0])),
+          cores: Object.fromEntries(Object.entries(coreBoxes)
+            .map(([m, sel]) => [m, sel.value]).filter(([, v]) => v)),
           download_url: dlUrl.value.trim(),
           download_min_bytes: Math.round((Number(dlMiB.value) || 0) * 1048576),
         },

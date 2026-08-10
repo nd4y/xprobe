@@ -65,6 +65,41 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 XRAY = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
+# Where the image keeps the cores it carries: /opt/xray/<version>/xray. A
+# check names the version it wants; several are shipped so one can be run
+# against the version its target actually serves, or two compared on the same
+# host.
+XRAY_DIR = os.environ.get("XRAY_DIR", "/opt/xray")
+
+
+def xray_versions() -> dict[str, str]:
+    """Cores available in this image: version -> path."""
+    out: dict[str, str] = {}
+    try:
+        for name in sorted(os.listdir(XRAY_DIR)):
+            path = os.path.join(XRAY_DIR, name, "xray")
+            if os.access(path, os.X_OK):
+                out[name] = path
+    except OSError:
+        pass
+    return out
+
+
+def xray_binary(version: str) -> str:
+    """The core a check asked for.
+
+    An unknown version is an error, never a quiet fall back to whatever is
+    installed: probing with a different core than the one requested produces a
+    confident answer to a question nobody asked — the exact failure this tool
+    exists to expose.
+    """
+    if not version:
+        return XRAY
+    have = xray_versions()
+    if version not in have:
+        raise LookupError(
+            f"xray {version} is not in this image (has: {', '.join(have) or 'none'})")
+    return have[version]
 # Where the last successfully applied document is kept. Survives a container
 # restart (volume), but does not have to survive re-creation: by then the
 # config gets re-read from the control plane anyway.
@@ -110,6 +145,10 @@ class Probe:
     spread: float = 0.5
     # Credentials for the centre's config endpoint (point name + secret).
     auth: tuple[str, str] | None = None
+    # Which core to run this check with. Empty means the image default. The
+    # tcp check ignores it: it opens a socket and a TLS handshake itself, with
+    # no core involved.
+    xray_version: str = ""
 
 
 @dataclass(frozen=True)
@@ -247,6 +286,7 @@ class Config:
                 jitter=float(spec.get("jitter", doc.get("jitter", 0.2))),
                 spread=float(spec.get("spread", doc.get("spread", 0.5))),
                 auth=auth,
+                xray_version=str(spec.get("xray_version") or doc.get("xray_version") or ""),
             ))
         if not probes:
             raise ValueError("the document has no enabled modes")
@@ -309,6 +349,8 @@ class Result:
     # TLS handshake. The difference between "the port accepted a connection"
     # and "the handshake succeeded" is exactly the failure stage we report.
     tls_ok: bool | None = None
+    # Why the check could not run at all, as opposed to running and failing.
+    error: str = ""
 
     @property
     def exit_checked(self) -> bool:
@@ -596,8 +638,15 @@ def probe_one(entry: dict, port: int, probe: Probe, cfg: Config) -> Result:
     # would be theatre, since the core has to be handed plaintext anyway.
     # Nothing here touches the filesystem, so there is nothing to leak, to
     # forget to delete, or to find in a backup.
+    try:
+        binary = xray_binary(probe.xray_version)
+    except LookupError as exc:
+        # Reported, not substituted: a result produced by another core would
+        # answer a different question while looking like an answer to this one.
+        res.error = str(exc)
+        return res
     proc = subprocess.Popen(
-        [XRAY, "run", "-c", "stdin:"],
+        [binary, "run", "-c", "stdin:"],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
@@ -744,10 +793,24 @@ def render(state: State, cfg: Config) -> str:
     out.append("# TYPE xprobe_configs gauge")
     out.append("# HELP xprobe_subscription_ok 1 — the subscription was read")
     out.append("# TYPE xprobe_subscription_ok gauge")
+    out.append("# HELP xprobe_check_core which xray core a check runs with")
+    out.append("# TYPE xprobe_check_core gauge")
+    out.append("# HELP xprobe_check_runnable 0 — the check cannot run at all (e.g. no such core)")
+    out.append("# TYPE xprobe_check_runnable gauge")
+    # The core version is a separate series rather than a label on the results:
+    # adding a label to xray_proxy_* would split every existing series and
+    # break the dashboards that already read them.
+    available = xray_versions()
     for probe in cfg.probes:
         lbl = f'probe="{probe.kind}"{extra}'
         out.append(f"xprobe_configs{{{lbl}}} {configs.get(probe.kind, 0)}")
         out.append(f"xprobe_subscription_ok{{{lbl}}} {0 if errors.get(probe.kind) else 1}")
+        if probe.kind != "tcp":
+            # tcp runs no core, so reporting one for it would be a lie.
+            wanted = probe.xray_version or "default"
+            runnable = 1 if (not probe.xray_version or probe.xray_version in available) else 0
+            out.append(f'xprobe_check_core{{{lbl},version="{escape(wanted)}"}} 1')
+            out.append(f"xprobe_check_runnable{{{lbl}}} {runnable}")
     # The applied document version, and the fact one is applied at all: the
     # control plane can see an edit reached the point without waiting for a
     # behavior change.
@@ -1010,9 +1073,14 @@ def enroll(control_url: str, enroll_token: str, nid: str, timeout: int = 20) -> 
 
 def report_geo(control_url: str, point: str, secret: str, geo: dict) -> None:
     """Report our location to the control plane. Failure is tolerable: this is
-    for display, not for operation."""
+    for display, not for operation.
+
+    The cores this image carries ride along, so the control plane can tell
+    which versions a point can actually be asked for — and say so instead of
+    letting a check silently fail to start.
+    """
     url = control_url.rstrip("/") + f"/api/points/{urllib.parse.quote(point)}/geo"
-    body = json.dumps(geo).encode()
+    body = json.dumps(dict(geo, xray_versions=sorted(xray_versions()))).encode()
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
     creds = base64.b64encode(f"{point}:{secret}".encode()).decode()

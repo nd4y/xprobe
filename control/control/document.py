@@ -32,6 +32,10 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
         spec: dict[str, Any] = {
             "enabled": enabled,
             "interval": int(point.intervals.get(kind) or interval_default[kind]),
+            # Which core this check runs with; empty means the image default.
+            # The tcp check ignores it — it opens a socket and a TLS handshake
+            # itself, with no core in the path.
+            "xray_version": point.cores.get(kind, ""),
             # Where the check's configs come from. The control plane filters
             # them by the point's target set, so a probe never holds a
             # subscription link and never sees a config outside its own set.

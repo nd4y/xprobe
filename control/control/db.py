@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS points (
     modes             TEXT NOT NULL DEFAULT '{}',   -- {"tcp":true,...}
     intervals         TEXT NOT NULL DEFAULT '{}',   -- per-check interval overrides
     targets           TEXT NOT NULL DEFAULT '{}',   -- {"tcp":[names],"status":[],"download":[]}
+    cores             TEXT NOT NULL DEFAULT '{}',   -- {"status":"v26.7.28",...} per check
+    xray_versions     TEXT NOT NULL DEFAULT '[]',   -- what the probe reports it carries
     download_url      TEXT NOT NULL DEFAULT '',     -- volume test source, empty = fleet default
     download_min_bytes INTEGER NOT NULL DEFAULT 0,  -- volume that must get through
     exit_expectations TEXT NOT NULL DEFAULT '',     -- json or empty (fleet defaults)
@@ -109,6 +111,15 @@ class Point:
     # panel squads: the control plane filters the configs itself, so target
     # edits never write to the panel.
     targets: dict[str, list[str]] = None  # type: ignore[assignment]
+    # Which xray core each check runs with, e.g. {"status": "v26.7.28"}. Empty
+    # means the probe image's default. Per check because the answer differs by
+    # core: a config that works on one version can fail silently on another,
+    # which is the whole reason this tool exists.
+    cores: dict[str, str] = None  # type: ignore[assignment]
+    # Cores the probe reports it carries. Reported, never configured — the
+    # image decides, and this is how the UI can warn before a check is set to
+    # a version the node does not have.
+    xray_versions: list[str] = None  # type: ignore[assignment]
     # Volume-tolerance test settings; empty/0 means the fleet default. Per
     # point because how much a network lets through is a property of that
     # network, not of the fleet.
@@ -128,6 +139,10 @@ class Point:
             self.intervals = {}
         if self.targets is None:
             self.targets = {}
+        if self.cores is None:
+            self.cores = {}
+        if self.xray_versions is None:
+            self.xray_versions = []
 
     def public(self) -> dict[str, Any]:
         """The point as the UI sees it — without the secret and the node IP.
@@ -145,7 +160,8 @@ class Point:
             "tcp_squad": self.tcp_squad,
             "has_check_sub": bool(self.check_sub_url), "has_load_sub": bool(self.load_sub_url),
             "modes": self.modes, "intervals": self.intervals,
-            "targets": self.targets,
+            "targets": self.targets, "cores": self.cores,
+            "xray_versions": self.xray_versions,
             "download_url": self.download_url,
             "download_min_bytes": self.download_min_bytes,
             "exit_expectations": self.exit_expectations,
@@ -167,6 +183,10 @@ def connect(path: str) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE points ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     if "targets" not in have:
         conn.execute("ALTER TABLE points ADD COLUMN targets TEXT NOT NULL DEFAULT '{}'")
+    if "cores" not in have:
+        conn.execute("ALTER TABLE points ADD COLUMN cores TEXT NOT NULL DEFAULT '{}'")
+    if "xray_versions" not in have:
+        conn.execute("ALTER TABLE points ADD COLUMN xray_versions TEXT NOT NULL DEFAULT '[]'")
     if "download_min_bytes" not in have:
         conn.execute("ALTER TABLE points ADD COLUMN download_min_bytes INTEGER NOT NULL DEFAULT 0")
     conn.commit()
@@ -201,7 +221,8 @@ def _row_to_point(r: sqlite3.Row) -> Point:
         check_sub_url=r["check_sub_url"], load_sub_url=r["load_sub_url"],
         tcp_sub_url=r["tcp_sub_url"],
         modes=json.loads(r["modes"] or "{}"), intervals=json.loads(r["intervals"] or "{}"),
-        targets=json.loads(r["targets"] or "{}"),
+        targets=json.loads(r["targets"] or "{}"), cores=json.loads(r["cores"] or "{}"),
+        xray_versions=json.loads(r["xray_versions"] or "[]"),
         download_url=r["download_url"], download_min_bytes=r["download_min_bytes"],
         exit_expectations=json.loads(r["exit_expectations"]) if r["exit_expectations"] else None,
         push_enabled=bool(r["push_enabled"]), enabled=bool(r["enabled"]),
@@ -234,16 +255,17 @@ def create_point(conn: sqlite3.Connection, point: Point, secret: str) -> None:
            (name, secret_hash, node_id, vantage, country, city, isp, ip, pin_geo,
             check_account, load_account, tcp_account, check_squad, load_squad,
             tcp_squad, check_sub_url, load_sub_url, tcp_sub_url, modes, intervals,
-            targets, download_url, download_min_bytes, exit_expectations,
-            push_enabled, enabled, version, note, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            targets, cores, xray_versions, download_url, download_min_bytes,
+            exit_expectations, push_enabled, enabled, version, note, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (point.name, hash_secret(secret), point.node_id or None, point.vantage,
          point.country, point.city, point.isp, point.ip, int(point.pin_geo),
          point.check_account, point.load_account, point.tcp_account,
          point.check_squad, point.load_squad, point.tcp_squad,
          point.check_sub_url, point.load_sub_url, point.tcp_sub_url,
          json.dumps(point.modes), json.dumps(point.intervals),
-         json.dumps(point.targets),
+         json.dumps(point.targets), json.dumps(point.cores),
+         json.dumps(point.xray_versions),
          point.download_url, point.download_min_bytes,
          json.dumps(point.exit_expectations) if point.exit_expectations else "",
          int(point.push_enabled), int(point.enabled), 1, point.note, time.time()),
@@ -258,9 +280,9 @@ EDITABLE = {
     "tcp_squad", "check_sub_url", "load_sub_url", "tcp_sub_url", "modes",
     "intervals", "exit_expectations", "push_enabled", "enabled", "note",
     "check_account", "load_account", "tcp_account",
-    "download_url", "download_min_bytes", "targets",
+    "download_url", "download_min_bytes", "targets", "cores",
 }
-_JSON_FIELDS = {"modes", "intervals", "exit_expectations", "targets"}
+_JSON_FIELDS = {"modes", "intervals", "exit_expectations", "targets", "cores"}
 
 
 def update_point(conn: sqlite3.Connection, name: str, changes: dict[str, Any]) -> int:
@@ -296,6 +318,14 @@ def delete_point(conn: sqlite3.Connection, name: str) -> bool:
     cur = conn.execute("DELETE FROM points WHERE name = ?", (name,))
     conn.commit()
     return cur.rowcount > 0
+
+
+def update_xray_versions(conn: sqlite3.Connection, name: str, versions: list[str]) -> None:
+    """What the probe says it carries. Reported, never configured — and it does
+    not bump the version: learning about the image is not a config change."""
+    conn.execute("UPDATE points SET xray_versions = ? WHERE name = ?",
+                 (json.dumps(sorted(set(versions))), name))
+    conn.commit()
 
 
 def update_geo(conn: sqlite3.Connection, name: str, *, country: str, city: str,
