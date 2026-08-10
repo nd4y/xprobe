@@ -285,12 +285,20 @@ async function pointView(name) {
   search.oninput = renderRows;
   renderRows();
 
+  const missing = p.missing_targets || [];
   const targetsCard = el('div', { class: 'card' }, [
     el('div', { class: 'section-title' }, [
       el('h3', {}, 'Targets'),
       el('div', { class: 'muted' },
         'Each check has its own target set. tcp and http are cheap — the full set is fine; download is heavy, keep its set short.'),
     ]),
+    // A target the point's account cannot see is served as nothing: the check
+    // would look healthy while probing less than asked.
+    missing.length ? el('div', { class: 'warn' }, [
+      el('b', {}, `${missing.length} target(s) not visible to this point: `),
+      missing.join(', '),
+      el('div', { class: 'muted' }, 'Its panel account does not carry these hosts — check the account’s squad.'),
+    ]) : null,
     el('div', { class: 'targets-tools' }, [search]),
     el('div', { class: 'targets' }, el('div', { class: 'scroll' },
       el('table', {}, [

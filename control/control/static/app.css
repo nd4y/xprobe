@@ -168,6 +168,13 @@ dialog h2 { font-size: 20px; margin-bottom: 14px; }
   background: var(--ink); color: var(--surface); padding: 11px 20px; border-radius: 999px; font-size: 14px;
 }
 
+/* a condition that makes a check quietly probe less than it was told to */
+.warn {
+  border: 1px solid var(--danger); border-radius: 12px; padding: 10px 14px;
+  font-size: 13px; color: var(--ink); background: var(--danger-container);
+}
+.warn .muted { margin-top: 4px; }
+
 /* command blocks in dialogs */
 .cmd { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
 .cmd .secret { margin: 4px 0 0; max-height: 260px; overflow: auto; }

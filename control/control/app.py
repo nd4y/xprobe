@@ -59,6 +59,9 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
     # point name -> (fetched_at, configs). In memory only: it is a cache of
     # someone else's data, and losing it on restart costs one fetch.
     _sub_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+    # (point, check) -> targets the account's subscription does not contain.
+    # Filled when configs are served; surfaced in the point's admin view.
+    _missing_targets: dict[tuple[str, str], list[str]] = {}
 
     # ── administrator sign-in ───────────────────────────────────────────────
 
@@ -213,7 +216,16 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             configs = _subscription(p)
         except Exception as exc:  # noqa: BLE001 — panel/network, one failure mode
             raise HTTPException(502, f"subscription unavailable: {exc}") from exc
-        return JSONResponse([c for c in configs if c.get("remarks") in wanted])
+        chosen = [c for c in configs if c.get("remarks") in wanted]
+        # A target the account cannot see yields silently fewer configs than
+        # asked for — the check then looks healthy while probing less. Say so
+        # loudly, and remember it for the UI.
+        missing = sorted(wanted - {c.get("remarks") for c in configs})
+        _missing_targets[(p.name, kind)] = missing
+        if missing:
+            log.warning("point %s / %s: %d target(s) absent from its subscription: %s",
+                        p.name, kind, len(missing), ", ".join(missing))
+        return JSONResponse(chosen)
 
     # ── enroll: zero-touch node registration ────────────────────────────────
 
@@ -317,6 +329,12 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         out["tcp_remarks"] = t.get("tcp") or []
         out["check_remarks"] = t.get("status") or []
         out["load_remarks"] = t.get("download") or []
+        # Targets the point's account cannot actually see, as observed the
+        # last time it asked for configs. Empty until it does.
+        out["missing_targets"] = sorted({
+            name for (pt, _), names in _missing_targets.items() if pt == p.name
+            for name in names
+        })
         return out
 
     @admin.patch("/api/admin/points/{name}")
