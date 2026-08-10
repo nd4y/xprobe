@@ -12,8 +12,8 @@ dead WARP is masked by the DIRECT fallback — the config keeps working and "did
 the connection come up" answers "yes". The only way to tell is the address the
 traffic actually left from.
 
-The modes (tcp | status | download) run **concurrently, in one process**, each
-with its own subscription, interval and target set. Together they answer AT
+The modes (tcp | tunnel | status | download) run **concurrently, in one
+process**, each with its own subscription, interval and target set. Together they answer AT
 WHICH STAGE things broke: no connect — network or address blocking; TCP up but
 no TLS — SNI-based filtering; status red — protocol; download red — the
 channel collapses under load.
@@ -98,6 +98,13 @@ CORE_CACHE = os.environ.get("CORE_CACHE", "/var/lib/xprobe/cores")
 # it cannot turn the fleet into a delivery channel for code of its choosing.
 CORE_URL = "https://github.com/XTLS/Xray-core/releases/download/{version}/Xray-linux-64.zip"
 
+# A version is also a path component under the cache directory, so it must be
+# a plain name. Checked before any other use: with relaying enabled the
+# control plane supplies both the bytes and the checksum, and a version like
+# "../.." would let it choose where the fetched file lands — exactly the kind
+# of reach the fixed download URL exists to deny.
+SAFE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
 
 def xray_versions() -> dict[str, str]:
     """Cores this node can run right now: version -> path.
@@ -134,6 +141,8 @@ def fetch_core(version: str, sha256: str, *, control_url: str = "", point: str =
     the entire reason this is safe to do, so failing it is fatal, never a
     warning.
     """
+    if not SAFE_VERSION.match(version):
+        raise ValueError(f"refusing version name {version!r} — not a plain release tag")
     if not sha256:
         raise ValueError(f"no checksum for xray {version} — refusing to fetch it")
 
@@ -257,7 +266,7 @@ def env_int(name: str, default: int) -> int:
 class Probe:
     """One mode: its own config source, interval and port range."""
 
-    kind: str                      # tcp | status | download
+    kind: str                      # tcp | tunnel | status | download
     # Where this check's configs come from. In control-plane mode this is the
     # centre's per-check endpoint, which returns configs already filtered to
     # this point's target set; in the legacy environment mode it is a panel
@@ -806,7 +815,9 @@ def probe_tunnel(entry: dict, port: int, probe: Probe, cfg: Config) -> Result:
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
-        with proc.stdin as sink:
+        # A core that dies instantly (a version without stdin: support, say)
+        # breaks the pipe mid-write. That is "the check is down", not a crash.
+        with contextlib.suppress(OSError), proc.stdin as sink:
             sink.write(json.dumps(client_config(entry, port)).encode())
         if not wait_port(port, time.time() + 10):
             return res
@@ -861,7 +872,9 @@ def probe_one(entry: dict, port: int, probe: Probe, cfg: Config) -> Result:
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
-        with proc.stdin as sink:
+        # Same guard as in probe_tunnel: a core dying before it reads the
+        # config must not take the whole mode's thread with it.
+        with contextlib.suppress(OSError), proc.stdin as sink:
             sink.write(json.dumps(client_config(entry, port)).encode())
         if not wait_port(port, time.time() + 10):
             return res
@@ -931,14 +944,25 @@ def run_probe(probe: Probe, state: State, cfg: Config, stop: threading.Event) ->
             if stop.is_set():
                 return
             entry = entries[n]
-            if probe.kind == "tcp":
-                res = probe_tcp(entry, probe, cfg)
-            elif probe.kind == "tunnel":
-                res = probe_tunnel(entry, probe.start_port + n, probe, cfg)
-            else:
-                # The port stays tied to the config's index: concurrent modes
-                # must not land on the same port.
-                res = probe_one(entry, probe.start_port + n, probe, cfg)
+            try:
+                if probe.kind == "tcp":
+                    res = probe_tcp(entry, probe, cfg)
+                elif probe.kind == "tunnel":
+                    res = probe_tunnel(entry, probe.start_port + n, probe, cfg)
+                else:
+                    # The port stays tied to the config's index: concurrent
+                    # modes must not land on the same port.
+                    res = probe_one(entry, probe.start_port + n, probe, cfg)
+            except Exception as exc:  # noqa: BLE001 — one config must not kill the mode
+                # An unforeseen failure on one config — a malformed entry, an
+                # OS-level surprise — is recorded as that config being down.
+                # Letting it escape would kill this mode's thread, and the
+                # whole check would silently vanish from the metrics until
+                # the next restart.
+                res = Result(kind=probe.kind, name=entry.get("remarks") or "?",
+                             checked_at=time.time(),
+                             error=f"{type(exc).__name__}: {exc}")
+                print(f"[{probe.kind}] {res.name}: check failed: {res.error}", flush=True)
             with state.lock:
                 state.results[(probe.kind, res.name)] = res
             if gap and stop.wait(random.uniform(0, 2 * gap)):

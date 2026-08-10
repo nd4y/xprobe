@@ -170,6 +170,47 @@ def test_a_point_that_owes_no_metrics_is_not_called_dead(tmp_path):
     assert h["expects_metrics"] is False
 
 
+def test_a_version_that_is_not_a_plain_tag_never_enters_the_catalogue(tmp_path):
+    # On the node a version is a path component under the core cache. With
+    # relaying on, "../.." would let the control plane choose where the file
+    # lands — the exact reach the fixed download URL exists to deny.
+    _, admin, _ = build(tmp_path)
+    for bad in ("../evil", "v1/..", "a\\b", ".hidden", ""):
+        r = admin.post("/api/admin/cores", cookies=owner_cookie(),
+                       json={"version": bad, "sha256": "a" * 64})
+        assert r.status_code == 400, bad
+
+
+def test_malformed_edit_payloads_are_rejected_at_the_door(tmp_path):
+    # A wrong-shaped value would not fail on the PATCH — it would fail later,
+    # as a 500 on every document build for this point.
+    _, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar"), "sec")
+    for bad in ({"modes": "tcp"}, {"modes": {"tcp": "yes"}},
+                {"intervals": {"tcp": "fast"}}, {"cores": {"status": 1}},
+                {"targets": {"tcp": "RU · TLS"}}):
+        r = admin.patch("/api/admin/points/yar", cookies=owner_cookie(), json=bad)
+        assert r.status_code == 400, bad
+    # A string instead of a list would be exploded into letters by set().
+    r = admin.post("/api/admin/points/yar/set", cookies=owner_cookie(),
+                   json={"tcp_remarks": "RU · TLS"})
+    assert r.status_code == 400
+    assert db.get_point(deps.conn, "yar").version == 1     # nothing was written
+
+
+def test_enroll_slug_stays_ascii(tmp_path):
+    # The slug becomes a point name and a panel username; a city reported in
+    # another alphabet must fall through, not produce a name the panel rejects.
+    points, admin, deps = build(tmp_path)
+    tok = _issue(admin, label="")["token"]
+    r = points.post("/api/enroll", json={"token": tok, "node_id": "n1",
+                                         "geo": {"city": "Ярославль"}})
+    assert r.status_code == 200
+    name = r.json()["point"]
+    assert name.isascii()
+    assert db.get_point(deps.conn, name) is not None
+
+
 def test_core_catalogue_requires_a_checksum(tmp_path):
     # The checksum is the only reason fetching a binary is safe at all, so a
     # version without one cannot enter the catalogue.

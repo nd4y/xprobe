@@ -123,6 +123,22 @@ def test_a_core_without_a_checksum_is_never_fetched(monkeypatch, tmp_path):
         prober.fetch_core("v26.7.28", "")
 
 
+def test_a_version_that_is_not_a_plain_name_is_refused(monkeypatch, tmp_path):
+    # The version becomes a path under the cache; with relaying enabled the
+    # control plane supplies both bytes and checksum, so "../.." would let it
+    # choose where the file lands. Refused before any network access.
+    monkeypatch.setattr(prober, "CORE_CACHE", str(tmp_path / "cores"))
+
+    def no_network(*a, **k):
+        raise AssertionError("must be refused before any fetch")
+
+    monkeypatch.setattr(prober.urllib.request, "urlopen", no_network)
+    for bad in ("../evil", "v1/..", "a\\b", ".hidden"):
+        with pytest.raises(ValueError, match="plain release tag"):
+            prober.fetch_core(bad, "a" * 64)
+    assert not (tmp_path / "cores").exists()
+
+
 def test_unused_cores_are_removed_but_the_image_is_left_alone(monkeypatch, tmp_path):
     # Cached cores are tens of megabytes each; one that nothing asks for any
     # more should not sit on someone else's disk forever. What the image

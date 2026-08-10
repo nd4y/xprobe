@@ -1,11 +1,11 @@
 """Point storage. SQLite: the fleet is tens of points, not millions.
 
 Only what the control plane itself manages lives here: point names, secret
-hashes, labels, modes, intervals and subscription links. The target set (which
-servers a point checks) lives in the panel — only the uuids of the squads it
-is pinned to are stored. Usage, node status, metrics — not here: those are
-other systems' data, and duplicating them would create a second answer to the
-same question.
+hashes, labels, modes, intervals, subscription links and the target sets
+(which servers each check probes — `targets`). Legacy squad uuids are kept
+solely to migrate points provisioned before the control plane filtered
+configs. Usage, node status, metrics — not here: those are other systems'
+data, and duplicating them would create a second answer to the same question.
 """
 
 from __future__ import annotations

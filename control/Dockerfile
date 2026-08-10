@@ -1,6 +1,5 @@
-# The service is light: FastAPI + httpx + sqlite. No registry in this setup —
-# the image is built on the host, so the stack must be deployed with
-# pullImage: false.
+# The service is light: FastAPI + httpx + sqlite. Built by CI and published
+# to ghcr.io/nd4y/xprobe-control; the same file builds locally for development.
 FROM python:3.13-slim
 
 WORKDIR /app

@@ -255,9 +255,15 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         _auth_point(point, request)
         if not _relay_cores_enabled():
             raise HTTPException(403, "core relay is disabled")
-        entry = next((c for c in _core_catalogue() if c["version"] == version), None)
+        catalogue = _core_catalogue()
+        entry = next((c for c in catalogue if c["version"] == version), None)
         if entry is None:
             raise HTTPException(404, "version is not in the catalogue")
+        # A blob whose version left the catalogue can never be served again —
+        # drop it rather than hold megabytes until the next restart.
+        alive = {c["version"] for c in catalogue}
+        for gone in [v for v in _core_blobs if v not in alive]:
+            del _core_blobs[gone]
 
         blob = _core_blobs.get(version)
         if blob is None:
@@ -413,10 +419,30 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         })
         return out
 
+    def _validate_edit(payload: dict[str, Any]) -> None:
+        """Shapes of the JSON-typed fields, checked at the door.
+
+        A malformed value would not fail here — it would fail later, as a 500
+        on every document build for this point, which is a far worse place to
+        learn about a typo in an API call.
+        """
+        for key in ("modes", "intervals", "targets", "cores", "exit_expectations"):
+            if key in payload and payload[key] is not None \
+                    and not isinstance(payload[key], dict):
+                raise HTTPException(400, f"{key} must be an object")
+        for key, want in (("modes", bool), ("intervals", int), ("cores", str)):
+            for k, v in (payload.get(key) or {}).items():
+                if not isinstance(v, want):
+                    raise HTTPException(400, f"{key}.{k} must be a {want.__name__}")
+        for k, v in (payload.get("targets") or {}).items():
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise HTTPException(400, f"targets.{k} must be a list of host names")
+
     @admin.patch("/api/admin/points/{name}")
     def admin_update(name: str, payload: dict[str, Any], _: dict = Depends(require_owner)) -> dict:
         if db.get_point(deps.conn, name) is None:
             raise HTTPException(404, "point not found")
+        _validate_edit(payload)
         version = db.update_point(deps.conn, name, payload)
         return {"ok": True, "version": version}
 
@@ -427,6 +453,12 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         p = db.get_point(deps.conn, name)
         if p is None:
             raise HTTPException(404, "point not found")
+        for key in ("tcp_remarks", "tunnel_remarks", "check_remarks", "load_remarks"):
+            v = payload.get(key)
+            # A string here would be silently exploded into letters by set().
+            if v is not None and (not isinstance(v, list)
+                                  or not all(isinstance(x, str) for x in v)):
+                raise HTTPException(400, f"{key} must be a list of host names")
         targets = {
             "tcp": sorted(set(payload.get("tcp_remarks") or [])),
             "tunnel": sorted(set(payload.get("tunnel_remarks") or [])),
@@ -572,6 +604,10 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         return configs
 
     SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+    # A version is a release tag and, on the node, a path component under the
+    # core cache. The same rule is enforced by the probe before any use; it is
+    # checked here too so a bad entry never enters the catalogue at all.
+    VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
     def _core_catalogue() -> list[dict[str, str]]:
         raw = db.get_setting(deps.conn, "core_catalogue")
@@ -606,8 +642,8 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         """
         version = str(payload.get("version") or "").strip()
         sha = str(payload.get("sha256") or "").strip()
-        if not version:
-            raise HTTPException(400, "version is required")
+        if not VERSION_RE.match(version):
+            raise HTTPException(400, "version must be a plain release tag, e.g. v26.7.28")
         if not SHA256_RE.match(sha):
             raise HTTPException(400, "sha256 must be 64 hex characters")
         catalogue = [c for c in _core_catalogue() if c["version"] != version]
@@ -683,8 +719,12 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         }
 
     def _slug(text: str) -> str:
-        out = "".join(c if c.isalnum() else "-" for c in text.lower()).strip("-")
-        return out[:24]
+        # ASCII only: the slug becomes a point name and a panel username, and
+        # the panel rejects usernames outside latin/digits — a city reported
+        # in another alphabet must fall through to the label or the token id,
+        # not fail enrolment.
+        out = "".join(c if c.isascii() and c.isalnum() else "-" for c in text.lower())
+        return out.strip("-")[:24]
 
     def _unique_name(base: str) -> str:
         base = base or "node"
