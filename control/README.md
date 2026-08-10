@@ -84,16 +84,23 @@ plane, metrics go through the relay.
 
 The "+ Add point" button in the UI, in one step:
 
-1. creates two panel squads `Monitor-<point>-check` / `-load` and fills them
-   with the selected hosts (via `excludedInternalSquads`, as everywhere);
-2. creates two monitoring accounts `monitor_<point>` / `_load` tagged
-   `MONITOR`;
+1. creates three panel squads `Monitor-<point>-tcp` / `-check` / `-load`, one
+   per check, and fills them with the selected hosts (via
+   `excludedInternalSquads`, as everywhere);
+2. creates three monitoring accounts `monitor_<point>_tcp` / `monitor_<point>`
+   / `_load` tagged `MONITOR`;
 3. saves their subscription links into its own DB (the hot path makes no panel
    calls);
-4. generates the point's secret and shows a **ready `docker run` command** to
-   hand to the point operator.
+4. generates the point's secret and shows **ready run commands** — `docker
+   run` and `kubectl apply` — to hand to the point operator.
 
-The secret is shown only once.
+Only a hash of the secret is stored, so the same commands can be re-issued
+for an existing point at any time — that rotates the secret, and the running
+probe has to be restarted with the new command.
+
+Points provisioned before the per-check target sets existed keep working: tcp
+falls back to the http set until their targets are saved once, which
+provisions the missing tcp squad.
 
 ## Deployment
 

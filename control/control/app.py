@@ -283,10 +283,14 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         if p is None:
             raise HTTPException(404, "point not found")
         out = p.public()
-        # The current target set is computed from the panel so the checkboxes
-        # in the UI reflect reality, not whatever was recorded once.
+        # The current target sets are computed from the panel so the checkboxes
+        # in the UI reflect reality, not whatever was recorded once. A point
+        # provisioned before the tcp set existed inherits the http targets
+        # until its own set is first saved.
         out["check_remarks"] = _squad_remarks(p.check_squad)
         out["load_remarks"] = _squad_remarks(p.load_squad)
+        out["tcp_remarks"] = (_squad_remarks(p.tcp_squad) if p.tcp_squad
+                              else out["check_remarks"])
         return out
 
     @admin.patch("/api/admin/points/{name}")
@@ -298,27 +302,43 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
 
     @admin.post("/api/admin/points/{name}/set")
     def admin_set(name: str, payload: dict[str, Any], _: dict = Depends(require_owner)) -> dict:
-        """Set the point's target set: edits its squads' membership in the panel."""
+        """Set the point's target sets: edits its squads' membership in the panel."""
         p = db.get_point(deps.conn, name)
         if p is None:
             raise HTTPException(404, "point not found")
         check = set(payload.get("check_remarks") or [])
         load = set(payload.get("load_remarks") or [])
+        tcp = set(payload.get("tcp_remarks") or [])
         _apply_set(p.check_squad, check)
         _apply_set(p.load_squad, load)
+        extra: dict[str, Any] = {}
+        if p.tcp_squad:
+            _apply_set(p.tcp_squad, tcp)
+        else:
+            # The point predates the tcp set — provision it on first save so
+            # legacy points migrate the moment their targets are edited.
+            squad, account, url = _make_set(p.name, "tcp", tcp)
+            extra = {"tcp_squad": squad, "tcp_account": account, "tcp_sub_url": url}
         # Bump the version: the set changed. The probe re-reads the subscription
         # on its own, but the document version is how the control plane can see
         # the change went out.
-        version = db.update_point(deps.conn, name, {"note": p.note})
+        version = db.update_point(deps.conn, name, {"note": p.note, **extra})
         return {"ok": True, "version": version}
 
     @admin.post("/api/admin/points/{name}/rotate-secret")
     def admin_rotate(name: str, _: dict = Depends(require_owner)) -> dict:
+        """Issue a fresh secret and the matching run commands.
+
+        Only the hash is stored, so a run command for an existing point can
+        only be produced together with a rotation — the old secret cannot be
+        shown again.
+        """
         if db.get_point(deps.conn, name) is None:
             raise HTTPException(404, "point not found")
         secret = secrets.token_urlsafe(24)
         db.rotate_secret(deps.conn, name, secret)
-        return {"ok": True, "secret": secret, "hint": "the secret is shown only once"}
+        return {"ok": True, "secret": secret, "install": _install_commands(name, secret),
+                "hint": "the secret is shown only once"}
 
     @admin.delete("/api/admin/points/{name}")
     def admin_delete(name: str, _: dict = Depends(require_owner)) -> dict:
@@ -364,7 +384,7 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
 
         return {
             "ok": True, "name": name, "secret": secret,
-            "install": _install_snippet(name, secret),
+            "install": _install_commands(name, secret),
             "hint": "the secret is shown only once — save it",
         }
 
@@ -425,34 +445,37 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             raise HTTPException(404, "point not found")
         return p
 
+    def _make_set(name: str, kind: str, remarks: set[str]) -> tuple[str, str, str]:
+        """One target set = one squad + one account. Returns (squad, account, url)."""
+        hosts = deps.panel.hosts()
+        inbounds, _ = plan_squad_membership("", hosts, remarks)
+        squad = deps.panel.create_squad(f"Monitor-{name}-{kind}", inbounds)
+        # Exclusions are applied once the squad uuid is known.
+        _apply_set(squad, remarks)
+        suffix = "" if kind == "check" else f"_{kind}"
+        user = deps.panel.create_user(
+            username=f"monitor_{name}{suffix}", squads=[squad], tag="MONITOR",
+            description=f"xprobe {name} {kind}")
+        return squad, user["username"], user.get("subscriptionUrl") or ""
+
     def _provision(name: str, check_remarks: set[str], load_remarks: set[str]) -> dict[str, Any]:
         """Create the point's own monitoring squads and accounts in the panel.
 
         Shared between manual provisioning and auto-enroll: every point gets
-        its own target set and its own subscription — a shared one would tie
+        its own target sets and its own subscriptions — shared ones would tie
         the inbound sets of unrelated points together, which is exactly what
-        separate sets exist to avoid.
+        separate sets exist to avoid. Three sets per point: tcp, http (the
+        historical `check`) and download (`load`); tcp starts with the same
+        targets as http.
         """
-        hosts = deps.panel.hosts()
-        check_inbounds, _ = plan_squad_membership("", hosts, check_remarks)
-        load_inbounds, _ = plan_squad_membership("", hosts, load_remarks)
-        check_squad = deps.panel.create_squad(f"Monitor-{name}-check", check_inbounds)
-        load_squad = deps.panel.create_squad(f"Monitor-{name}-load", load_inbounds)
-        # Exclusions are applied once the squad uuid is known.
-        _apply_set(check_squad, check_remarks)
-        _apply_set(load_squad, load_remarks)
-
-        check_user = deps.panel.create_user(
-            username=f"monitor_{name}", squads=[check_squad], tag="MONITOR",
-            description=f"xprobe {name} check")
-        load_user = deps.panel.create_user(
-            username=f"monitor_{name}_load", squads=[load_squad], tag="MONITOR",
-            description=f"xprobe {name} load")
+        check_squad, check_account, check_url = _make_set(name, "check", check_remarks)
+        load_squad, load_account, load_url = _make_set(name, "load", load_remarks)
+        tcp_squad, tcp_account, tcp_url = _make_set(name, "tcp", check_remarks)
         return {
-            "check_account": check_user["username"], "load_account": load_user["username"],
-            "check_squad": check_squad, "load_squad": load_squad,
-            "check_sub_url": check_user.get("subscriptionUrl") or "",
-            "load_sub_url": load_user.get("subscriptionUrl") or "",
+            "check_account": check_account, "load_account": load_account,
+            "tcp_account": tcp_account,
+            "check_squad": check_squad, "load_squad": load_squad, "tcp_squad": tcp_squad,
+            "check_sub_url": check_url, "load_sub_url": load_url, "tcp_sub_url": tcp_url,
         }
 
     def _slug(text: str) -> str:
@@ -492,9 +515,10 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             host.excluded = excluded
             deps.panel.patch_host(host)
 
-    def _install_snippet(name: str, secret: str) -> str:
+    def _install_commands(name: str, secret: str) -> dict[str, str]:
+        """Ready-to-paste run commands for the point, docker and kubernetes."""
         url = cfg.base_url or "https://<control-url>"
-        return (
+        docker = (
             "docker run -d --name xprobe --restart unless-stopped \\\n"
             "  -v xprobe-data:/var/lib/xprobe \\\n"
             f"  -e POINT={name} \\\n"
@@ -502,6 +526,35 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             f"  -e CONTROL_TOKEN={secret} \\\n"
             "  ghcr.io/nd4y/xprobe:latest"
         )
+        # A single self-contained apply: the identity comes from env, so an
+        # emptyDir is enough — a rescheduled pod re-reads its config from the
+        # control plane and only loses the metrics spool.
+        kubectl = f"""cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xprobe
+  labels: {{ app: xprobe }}
+spec:
+  replicas: 1
+  selector: {{ matchLabels: {{ app: xprobe }} }}
+  template:
+    metadata: {{ labels: {{ app: xprobe }} }}
+    spec:
+      containers:
+        - name: xprobe
+          image: ghcr.io/nd4y/xprobe:latest
+          env:
+            - {{ name: POINT, value: "{name}" }}
+            - {{ name: CONTROL_URL, value: "{url}" }}
+            - {{ name: CONTROL_TOKEN, value: "{secret}" }}
+          volumeMounts:
+            - {{ name: data, mountPath: /var/lib/xprobe }}
+      volumes:
+        - name: data
+          emptyDir: {{}}
+EOF"""
+        return {"docker": docker, "kubectl": kubectl}
 
     # ── health and UI ───────────────────────────────────────────────────────
 

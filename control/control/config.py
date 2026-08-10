@@ -44,8 +44,10 @@ class Defaults:
     push_url: str = ""
     push_interval: int = 60
     subscription_interval: int = 300
-    tcp_interval: int = 120
-    status_interval: int = 900
+    # tcp and http run concurrently on the same 5-minute schedule; the
+    # bandwidth check every 30 minutes.
+    tcp_interval: int = 300
+    status_interval: int = 300
     download_interval: int = 1800
     status_url: str = "http://cp.cloudflare.com/generate_204"
     download_url: str = "https://proof.ovh.net/files/1Mb.dat"

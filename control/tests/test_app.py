@@ -194,13 +194,47 @@ def test_provisioning_creates_squads_accounts_and_secret(tmp_path):
     })
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["secret"] and "docker run" in body["install"]
-    # Two squads and two monitoring accounts were created.
-    assert len(panel.squads_) == 2
-    assert set(panel.users) == {"monitor_yaroslavl", "monitor_yaroslavl_load"}
-    # The point landed in the control plane with its subscription link saved.
+    assert body["secret"]
+    assert "docker run" in body["install"]["docker"]
+    assert "kubectl apply" in body["install"]["kubectl"]
+    # Three squads and three accounts: tcp, http (check) and download (load).
+    assert len(panel.squads_) == 3
+    assert set(panel.users) == {"monitor_yaroslavl", "monitor_yaroslavl_load",
+                                "monitor_yaroslavl_tcp"}
+    # The point landed in the control plane with its subscription links saved.
     p = db.get_point(deps.conn, "yaroslavl")
     assert p.check_sub_url == "https://sub/monitor_yaroslavl"
+    assert p.tcp_sub_url == "https://sub/monitor_yaroslavl_tcp"
+
+
+def test_run_command_for_existing_point_rotates_and_returns_both_flavors(tmp_path):
+    # Only a hash is stored, so a run command can only come with a fresh
+    # secret — the endpoint rotates and hands back docker + kubectl.
+    _, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar"), "old")
+    before = db.get_secret_hash(deps.conn, "yar")
+    r = admin.post("/api/admin/points/yar/rotate-secret", cookies=owner_cookie())
+    assert r.status_code == 200
+    body = r.json()
+    assert "yar" in body["install"]["docker"] and body["secret"] in body["install"]["docker"]
+    assert "kubectl apply" in body["install"]["kubectl"]
+    assert db.get_secret_hash(deps.conn, "yar") != before   # rotated
+
+
+def test_legacy_point_gains_a_tcp_set_on_first_save(tmp_path):
+    # A point created before the tcp set existed has empty tcp_* columns; the
+    # first target save must provision the tcp squad and migrate it.
+    panel = FakePanel()
+    _, admin, deps = build(tmp_path, panel=panel)
+    db.create_point(deps.conn, db.Point(name="yar", check_squad="", load_squad=""), "sec")
+    assert db.get_point(deps.conn, "yar").tcp_squad == ""
+    r = admin.post("/api/admin/points/yar/set", cookies=owner_cookie(),
+                   json={"tcp_remarks": ["RU · TLS"], "check_remarks": ["RU · TLS"],
+                         "load_remarks": []})
+    assert r.status_code == 200
+    p = db.get_point(deps.conn, "yar")
+    assert p.tcp_squad and p.tcp_account == "monitor_yar_tcp"
+    assert p.tcp_sub_url == "https://sub/monitor_yar_tcp"
 
 
 def test_malformed_point_name_is_rejected(tmp_path):
@@ -277,8 +311,8 @@ def test_node_enrolls_and_gets_its_own_squads_and_subscriptions(tmp_path):
     p = db.get_point(deps.conn, body["point"])
     assert p.node_id == "abc123"
     assert p.check_account == f"monitor_{body['point']}"
-    assert p.check_sub_url and p.load_sub_url      # subscriptions exist right away
-    assert len(panel.squads_) == 2                 # its own pair of squads
+    assert p.check_sub_url and p.load_sub_url and p.tcp_sub_url  # subs exist right away
+    assert len(panel.squads_) == 3                 # tcp + http + download
 
 
 def test_two_nodes_get_different_subscriptions(tmp_path):
