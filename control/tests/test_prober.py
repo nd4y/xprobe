@@ -56,6 +56,41 @@ def test_enabled_mode_without_a_config_source_is_an_error():
         prober.Config.from_document(bad, point="p", push_password="t")
 
 
+def test_core_version_reaches_each_probe():
+    doc = dict(DOC, probes=dict(
+        DOC["probes"],
+        status={"enabled": True, "configs_url": f"{BASE}/status", "xray_version": "v26.7.28"},
+        tcp={"enabled": True, "configs_url": f"{BASE}/tcp"}))
+    cfg = prober.Config.from_document(doc, point="p", push_password="t")
+    by_kind = {p.kind: p for p in cfg.probes}
+    assert by_kind["status"].xray_version == "v26.7.28"
+    assert by_kind["tcp"].xray_version == ""       # tcp runs no core
+
+
+def test_an_unknown_core_is_refused_not_substituted(monkeypatch, tmp_path):
+    # Probing with a different core than the one asked for produces a
+    # confident answer to a question nobody asked.
+    (tmp_path / "v26.7.28").mkdir()
+    binary = tmp_path / "v26.7.28" / "xray"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(prober, "XRAY_DIR", str(tmp_path))
+
+    assert prober.xray_binary("v26.7.28") == str(binary)
+    with pytest.raises(LookupError, match="v26.3.27"):
+        prober.xray_binary("v26.3.27")
+
+
+def test_a_check_with_a_missing_core_reports_instead_of_running(monkeypatch, tmp_path):
+    monkeypatch.setattr(prober, "XRAY_DIR", str(tmp_path))          # no cores at all
+    probe = prober.Probe(kind="status", subscription_url="", interval=300, start_port=20000,
+                         timeout=5, url="http://example", xray_version="v26.3.27")
+    res = prober.probe_one({"remarks": "x", "outbounds": [{}]}, 20000, probe,
+                           prober.Config(probes=(probe,)))
+    assert res.up is False
+    assert "v26.3.27" in res.error
+
+
 def test_a_disabled_document_builds_nothing(monkeypatch, tmp_path):
     # The probe must stand down rather than keep its old configuration: this
     # is what makes disabling a point in the UI actually stop the node.

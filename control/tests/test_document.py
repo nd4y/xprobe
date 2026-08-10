@@ -90,6 +90,16 @@ def test_volume_test_settings_are_per_point():
     assert plain["probes"]["download"]["min_bytes"] == DEF.download_min_bytes
 
 
+def test_each_check_carries_its_own_core_version():
+    # A config that works on one core can fail silently on another — that is
+    # the whole reason this tool exists, so the version is per check.
+    doc = build_document(point(cores={"status": "v26.7.28", "download": "v26.3.27"}), DEF)
+    assert doc["probes"]["status"]["xray_version"] == "v26.7.28"
+    assert doc["probes"]["download"]["xray_version"] == "v26.3.27"
+    # Unset means the image default, not a guess.
+    assert doc["probes"]["tcp"]["xray_version"] == ""
+
+
 def test_document_says_whether_the_point_is_enabled():
     # This flag is what stops a probe: it cannot be inferred from silence.
     assert build_document(point(), DEF)["enabled"] is True

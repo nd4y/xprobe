@@ -1,22 +1,31 @@
-# The core is pinned to the version running on the nodes. That is the whole
-# point of a custom probe: xray-checker compiles the core into its binary
-# (26.3.27), and XHTTP against 26.7.28 nodes fails silently. Here a divergence
-# is visible in one line and fixed by one rebuild.
+# The core version is the whole point of a custom probe: xray-checker compiles
+# one in (26.3.27), and XHTTP against 26.7.28 nodes fails silently. Here the
+# versions are explicit, and several are carried at once so a check can be run
+# with the version its target actually serves — or two versions compared
+# against the same host.
+#
+# The first entry is the default. Each lands in /opt/xray/<version>/xray; the
+# probe picks one per check and refuses to substitute another, because a
+# silent substitution is exactly the failure this tool exists to expose.
 FROM python:3.13-slim
 
-ARG XRAY_VERSION=v26.7.28
+ARG XRAY_VERSIONS="v26.7.28 v26.3.27"
 
 # curl and unzip are needed only at build time and removed immediately: the
 # probe reaches out with its own code (SOCKS5 and HTTP live in prober.py), and
 # an image that holds other people's configs should not carry extra tools.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates unzip \
- && curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
-      -o /tmp/xray.zip \
- && unzip -q /tmp/xray.zip -d /usr/local/bin xray \
- && chmod +x /usr/local/bin/xray \
- && rm /tmp/xray.zip \
- && xray version \
+ && for v in ${XRAY_VERSIONS}; do \
+      curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/$v/Xray-linux-64.zip" \
+        -o /tmp/xray.zip \
+   && mkdir -p "/opt/xray/$v" \
+   && unzip -q /tmp/xray.zip -d "/opt/xray/$v" xray \
+   && chmod +x "/opt/xray/$v/xray" \
+   && rm /tmp/xray.zip \
+   && "/opt/xray/$v/xray" version | head -1; \
+    done \
+ && ln -s "/opt/xray/$(echo ${XRAY_VERSIONS} | cut -d' ' -f1)/xray" /usr/local/bin/xray \
  && apt-get purge -y --auto-remove curl unzip \
  && rm -rf /var/lib/apt/lists/*
 
