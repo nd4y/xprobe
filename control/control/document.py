@@ -70,6 +70,10 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
     doc: dict[str, Any] = {
         "version": point.version,
         "point": point.name,
+        # A disabled point is told so rather than cut off: the probe has to
+        # learn it should stop, and refusing to answer looks exactly like an
+        # outage — which the probe is built to ride out by carrying on.
+        "enabled": point.enabled,
         "labels": labels,
         "subscription_interval": d.subscription_interval,
         "probes": probes,
