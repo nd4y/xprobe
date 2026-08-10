@@ -133,7 +133,7 @@ async function listView() {
 
   const toolbar = el('div', { class: 'toolbar' }, [
     el('h2', { class: 'grow' }, `Vantage points (${points.length})`),
-    el('button', { class: 'tonal', onclick: showEnroll }, 'Enroll token'),
+    el('button', { class: 'tonal', onclick: showTokens }, 'Enroll tokens'),
     el('button', { class: 'filled', onclick: addPoint }, '+ Add point'),
   ]);
 
@@ -315,9 +315,10 @@ async function pointView(name) {
     el('div', { class: 'section-title' }, [
       el('h3', {}, 'Deployment'),
       el('div', { class: 'muted' },
-        'Only a hash of the secret is stored, so a run command comes with a fresh secret — the running probe must be restarted with it.'),
+        'An enroll token lets this node fetch its secret and fetch it again after losing storage — and can be revoked for this node alone. A run command embeds a fresh secret instead, and the running probe must be restarted with it.'),
     ]),
     el('div', { class: 'row' }, [
+      el('button', { class: 'tonal', onclick: () => issueToken(name) }, 'Enroll token'),
       el('button', { class: 'tonal', onclick: () =>
         confirmDialog('Issue a run command?',
           'This rotates the point’s secret: the currently running probe keeps working until its next config poll, then needs the new command.',
@@ -371,30 +372,62 @@ async function pointView(name) {
 
 // ── dialogs ──────────────────────────────────────────────────────────────────
 
-// Enroll token: a node registers with the control plane using it. One-time
-// per node and rotatable — regenerating revokes the old token while
-// already-enrolled nodes are unaffected.
-async function showEnroll() {
-  const { token, control_url: controlUrl, kubectl } = await api('/admin/enroll-token');
-  const env = [
-    `CONTROL_URL=${controlUrl || location.origin}`,
-    `ENROLL_TOKEN=${token}`,
-  ].join('\n');
-  const rotate = el('button', { class: 'danger', onclick: () =>
-    confirmDialog('Regenerate the enroll token?',
-      'The old token stops working for new nodes. Already-connected nodes are unaffected.',
-      'Regenerate', async () => {
-        await api('/admin/enroll-token/rotate', { method: 'POST' });
-        showEnroll();
-      }) }, 'Regenerate');
-  const copy = el('button', { class: 'filled', onclick: () => {
-    navigator.clipboard.writeText(env).then(() => toast('Copied'));
-  } }, 'Copy .env');
-  dialog('Node enroll token', [
-    el('p', { class: 'muted' }, 'The point operator puts this into .env next to the compose file — nothing else. The node connects and determines its location by itself.'),
-    el('div', { class: 'secret' }, env),
-    kubectl ? cmdBlock('kubernetes (identity survives rescheduling, no storage needed)', kubectl) : null,
-  ], [rotate, copy]);
+// One token per node. A node keeps its token — it is what lets it come back
+// after losing its storage — so revoking one has to end that node's access
+// and nobody else's.
+async function showTokens() {
+  const tokens = await api('/admin/enroll-tokens');
+  const rows = tokens.map((t) => {
+    // The chip carries the revoked state; this line says what the token is for.
+    const state = t.point ? `bound to ${t.point}` : 'not used yet';
+    return el('div', { class: 'check-row' }, [
+      el('span', { class: 'grow' }, [
+        el('b', {}, t.label || '(no label)'),
+        el('span', { class: 'in' }, ` ${t.id}`),
+        el('div', { class: 'muted' }, state),
+      ]),
+      t.revoked ? chip('revoked', 'off') : el('button', { class: 'small danger', onclick: () =>
+        confirmDialog('Revoke this token?',
+          `The node can no longer come back after a restart. It keeps running on the secret it already has — disable its point too if you want it to stop now.`,
+          'Revoke', async () => {
+            await api(`/admin/enroll-tokens/${t.id}/revoke`, { method: 'POST' });
+            toast('Revoked'); showTokens();
+          }) }, 'Revoke'),
+    ]);
+  });
+  const issue = el('button', { class: 'filled', onclick: () => issueToken() }, '+ Issue token');
+  dialog('Enroll tokens', [
+    el('p', { class: 'muted' }, 'A node presents its token to get its point’s secret, and again whenever it loses it. Tokens are shown once — only their hashes are kept.'),
+    ...(rows.length ? rows : [el('div', { class: 'muted' }, 'No tokens issued yet.')]),
+  ], [issue]);
+}
+
+async function issueToken(pointName) {
+  const label = el('input', { placeholder: 'e.g. Ivan’s NAS' });
+  const points = pointName ? [] : await api('/admin/points');
+  const bind = pointName ? null : el('select', {}, [
+    el('option', { value: '' }, '— create a new point on first use —'),
+    ...points.map((p) => el('option', { value: p.name }, p.name)),
+  ]);
+  const go = el('button', { class: 'filled', onclick: async (e) => {
+    e.target.disabled = true;
+    try {
+      const r = await api('/admin/enroll-tokens', {
+        method: 'POST',
+        body: { label: label.value.trim(), point: pointName || (bind ? bind.value : '') },
+      });
+      dialog(`Token ${r.id}`, [
+        el('p', { class: 'muted' }, 'Shown once. This node — and only this node — uses it; revoke it to cut the node off.'),
+        cmdBlock('docker compose (.env)', r.env),
+        cmdBlock('kubernetes', r.kubectl),
+      ], []);
+    } catch (err) { toast(String(err.message)); e.target.disabled = false; }
+  } }, 'Issue');
+  dialog('Issue an enroll token', [
+    el('p', { class: 'muted' }, 'One token per node, so it can be taken back from that node alone.'),
+    el('label', { class: 'field' }, [el('span', {}, 'label'), label]),
+    bind ? el('label', { class: 'field' }, [el('span', {}, 'point'), bind]) : null,
+  ], [go]);
 }
 
 async function addPoint() {

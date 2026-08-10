@@ -1,4 +1,5 @@
 import base64
+import json
 
 import httpx
 from fastapi.testclient import TestClient
@@ -398,8 +399,10 @@ def test_point_config_needs_no_gateway_secret(tmp_path):
 # ── zero-touch: enroll, relay, geo ────────────────────────────────────────────
 
 
-def _token(admin):
-    return admin.get("/api/admin/enroll-token", cookies=owner_cookie()).json()["token"]
+def _issue(admin, **body):
+    r = admin.post("/api/admin/enroll-tokens", cookies=owner_cookie(), json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
 
 
 def test_node_enrolls_and_gets_its_own_account(tmp_path):
@@ -408,7 +411,8 @@ def test_node_enrolls_and_gets_its_own_account(tmp_path):
     # that is what lets one node be cut off without disturbing the others.
     panel = FakePanel()
     points, admin, deps = build(tmp_path, panel=panel)
-    r = points.post("/api/enroll", json={"token": _token(admin), "node_id": "abc123"})
+    tok = _issue(admin, label="Ivan's NAS")["token"]
+    r = points.post("/api/enroll", json={"token": tok, "node_id": "abc123"})
     assert r.status_code == 200
     body = r.json()
     p = db.get_point(deps.conn, body["point"])
@@ -419,24 +423,35 @@ def test_node_enrolls_and_gets_its_own_account(tmp_path):
     assert [s.name for s in panel.squads_] == ["Monitor"]
 
 
-def test_two_nodes_get_different_subscriptions(tmp_path):
+def test_each_node_has_its_own_token(tmp_path):
     panel = FakePanel()
     points, admin, deps = build(tmp_path, panel=panel)
-    tok = _token(admin)
-    a = points.post("/api/enroll", json={"token": tok, "node_id": "n-a"}).json()
-    b = points.post("/api/enroll", json={"token": tok, "node_id": "n-b"}).json()
+    a = points.post("/api/enroll", json={"token": _issue(admin, label="a")["token"],
+                                         "node_id": "n-a"}).json()
+    b = points.post("/api/enroll", json={"token": _issue(admin, label="b")["token"],
+                                         "node_id": "n-b"}).json()
     pa, pb = db.get_point(deps.conn, a["point"]), db.get_point(deps.conn, b["point"])
     assert pa.name != pb.name
     assert pa.check_sub_url != pb.check_sub_url
 
 
-def test_same_node_gets_the_same_point_with_a_new_secret(tmp_path):
-    points, admin, _ = build(tmp_path)
-    tok = _token(admin)
+def test_a_token_bound_to_a_point_always_returns_that_point(tmp_path):
+    # This is how a node comes back after losing its storage — and why the
+    # token has to keep working rather than be single-use.
+    points, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c"), "old")
+    tok = _issue(admin, label="yaroslavl", point="yar")["token"]
     first = points.post("/api/enroll", json={"token": tok, "node_id": "n1"}).json()
-    second = points.post("/api/enroll", json={"token": tok, "node_id": "n1"}).json()
-    assert first["point"] == second["point"]      # the same point
-    assert first["secret"] != second["secret"]    # the secret was rotated
+    second = points.post("/api/enroll", json={"token": tok, "node_id": "n2"}).json()
+    assert first["point"] == second["point"] == "yar"
+    assert first["secret"] != second["secret"]    # a fresh secret each time
+
+
+def test_a_token_for_an_unknown_point_is_refused(tmp_path):
+    _, admin, _ = build(tmp_path)
+    r = admin.post("/api/admin/enroll-tokens", cookies=owner_cookie(),
+                   json={"label": "x", "point": "nope"})
+    assert r.status_code == 404
 
 
 def test_invalid_enroll_token_is_rejected(tmp_path):
@@ -444,32 +459,51 @@ def test_invalid_enroll_token_is_rejected(tmp_path):
     assert points.post("/api/enroll", json={"token": "foreign", "node_id": "n"}).status_code == 403
 
 
-def test_token_rotation_revokes_the_old_one(tmp_path):
+def test_revoking_one_token_leaves_the_others_working(tmp_path):
+    # The reason tokens are per node: cutting one operator off must not mean
+    # re-keying everyone else.
     points, admin, _ = build(tmp_path)
-    old = _token(admin)
-    new = admin.post("/api/admin/enroll-token/rotate", cookies=owner_cookie()).json()["token"]
-    assert new != old
-    assert points.post("/api/enroll", json={"token": old, "node_id": "n"}).status_code == 403
-    assert points.post("/api/enroll", json={"token": new, "node_id": "n"}).status_code == 200
+    doomed = _issue(admin, label="going away")
+    kept = _issue(admin, label="staying")
+    assert admin.post(f"/api/admin/enroll-tokens/{doomed['id']}/revoke",
+                      cookies=owner_cookie()).status_code == 200
+    assert points.post("/api/enroll", json={"token": doomed["token"],
+                                            "node_id": "n"}).status_code == 403
+    assert points.post("/api/enroll", json={"token": kept["token"],
+                                            "node_id": "n"}).status_code == 200
 
 
-def test_enroll_manifest_pins_a_stable_node_id(tmp_path):
-    # Enrolment identifies a node by NODE_ID. On ephemeral storage a random
-    # one would enroll a brand new point every restart, so the manifest takes
-    # it from the pod name and uses a StatefulSet to keep that name stable.
+def test_a_revoked_token_cannot_bring_its_point_back(tmp_path):
+    # Revoking is what actually ends access: without it, disabling a point
+    # only stops that point while the node enrolls itself a new one.
+    points, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c"), "old")
+    issued = _issue(admin, label="yaroslavl", point="yar")
+    assert points.post("/api/enroll", json={"token": issued["token"],
+                                            "node_id": "n"}).status_code == 200
+    admin.post(f"/api/admin/enroll-tokens/{issued['id']}/revoke", cookies=owner_cookie())
+    assert points.post("/api/enroll", json={"token": issued["token"],
+                                            "node_id": "n"}).status_code == 403
+
+
+def test_tokens_are_listed_without_ever_showing_them(tmp_path):
     _, admin, _ = build(tmp_path)
-    manifest = admin.get("/api/admin/enroll-token", cookies=owner_cookie()).json()["kubectl"]
-    assert "kind: StatefulSet" in manifest
-    assert "name: NODE_ID" in manifest
-    assert "fieldPath: metadata.name" in manifest
+    issued = _issue(admin, label="Ivan's NAS")
+    listed = admin.get("/api/admin/enroll-tokens", cookies=owner_cookie()).json()
+    assert [t["label"] for t in listed] == ["Ivan's NAS"]
+    assert issued["token"] not in json.dumps(listed)
 
 
-def test_enroll_token_response_carries_the_public_url(tmp_path):
-    # The admin UI runs on another host, so its own origin would be wrong in
-    # the operator's .env — the public points URL comes from the backend.
+def test_issued_token_comes_with_ready_artifacts(tmp_path):
+    # The token is the node's identity and lives in the manifest, so nothing
+    # has to be persisted for it to come back — an emptyDir is enough.
     _, admin, _ = build(tmp_path)
-    body = admin.get("/api/admin/enroll-token", cookies=owner_cookie()).json()
-    assert body["control_url"] == "https://xprobe.example"
+    issued = _issue(admin, label="Ivan's NAS")
+    assert issued["control_url"] == "https://xprobe.example"
+    assert f"ENROLL_TOKEN={issued['token']}" in issued["env"]
+    assert "CONTROL_URL=https://xprobe.example" in issued["env"]
+    assert "kubectl apply" in issued["kubectl"]
+    assert issued["token"] in issued["kubectl"]
 
 
 def test_metrics_are_relayed_to_the_store(tmp_path):

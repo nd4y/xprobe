@@ -65,17 +65,29 @@ The point operator receives **two environment lines** — `CONTROL_URL` and
 4. fetches its document and starts pushing metrics **through the control-plane
    relay**.
 
-From then on the probe lives on the issued secret; the enroll token is no
-longer needed. The token is **one-time per node and rotatable**: regenerating
-it in the UI revokes the old one, while already-connected nodes are unaffected
-(they authenticate with their secrets). If a node loses its volume, re-enroll
-with the same `node_id` returns the same point with a fresh secret.
+## One token per node, because access has to be revocable
 
-That last sentence is the whole reason `node_id` must be stable: a node whose
-id changes enrols as a **new point** every restart. The enrol dialog therefore
-also hands out a Kubernetes manifest that pins it — a StatefulSet taking
-`NODE_ID` from the pod name — so enrolment works on ephemeral storage without
-growing a duplicate point per rescheduling.
+Each node gets **its own** enroll token, issued from the UI and shown once
+(only its hash is kept). A token is bound to a point on first use, so
+presenting it again — which is what a node does whenever it comes back
+without its storage — returns the same point with a fresh secret.
+
+A fleet-wide token could not be taken back from one operator: disabling their
+point stops that point, but the token still lets them enroll a new one and
+carry on. Revoking a per-node token ends that node's access and touches
+nobody else.
+
+The two levers do different things, and both are per node:
+
+* **revoke the token** — the node cannot come back after a restart. What is
+  running right now keeps running on the secret it already holds;
+* **disable the point** — it stops receiving configs immediately.
+
+Use both to cut an operator off for good.
+
+Because the token itself is the node's identity and it lives in the manifest,
+nothing needs to be persisted: an `emptyDir` is enough, and a rescheduled pod
+re-enrolls as the same point.
 
 **City and ISP are visible in the UI; the node's address is not.** The probe
 sets the `city`/`isp` labels itself and refreshes them on the fly if the
