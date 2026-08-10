@@ -17,13 +17,16 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import hmac
+import json
 import logging
 import re
 import secrets
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -36,6 +39,9 @@ from .oidc import OIDC, new_state
 from .panel import Panel
 
 log = logging.getLogger("xprobe-control")
+# The one place a core is ever fetched from, here as on the node. Hardcoded
+# on both sides so neither can be talked into pointing somewhere else.
+CORE_URL = "https://github.com/XTLS/Xray-core/releases/download/{version}/Xray-linux-64.zip"
 STATIC = Path(__file__).parent / "static"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}$")
 
@@ -62,6 +68,9 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
     # (point, check) -> targets the account's subscription does not contain.
     # Filled when configs are served; surfaced in the point's admin view.
     _missing_targets: dict[tuple[str, str], list[str]] = {}
+    # Release archives already fetched for relaying, kept so a fleet coming up
+    # at once costs one download rather than one per node.
+    _core_blobs: dict[str, bytes] = {}
 
     # ── administrator sign-in ───────────────────────────────────────────────
 
@@ -193,11 +202,14 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         p = db.get_point(deps.conn, point)
         if p is None:
             raise HTTPException(404, "point does not exist")
+        db.touch_point(deps.conn, p.name)
         # A disabled point still gets its document, carrying enabled=false.
         # Refusing would be indistinguishable from an outage, and a probe is
         # built to ride those out by carrying on with what it has — so the
         # only way to make it stop is to tell it.
-        return JSONResponse(build_document(p, cfg.defaults, base_url=cfg.base_url))
+        return JSONResponse(build_document(p, cfg.defaults, base_url=cfg.base_url,
+                                           cores=_core_catalogue(),
+                                           core_relay=_relay_cores_enabled()))
 
     @points.get("/api/points/{point}/configs/{kind}")
     def point_configs(point: str, kind: str, request: Request) -> JSONResponse:
@@ -230,6 +242,40 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             log.warning("point %s / %s: %d target(s) absent from its subscription: %s",
                         p.name, kind, len(missing), ", ".join(missing))
         return JSONResponse(chosen)
+
+    @points.get("/api/points/{point}/core/{version}")
+    def relay_core(point: str, version: str, request: Request) -> Response:
+        """Fetch a core on a node's behalf, when it cannot reach the release.
+
+        Offered only when relaying is enabled: it is the owner's service that
+        carries the traffic. Serving it changes nothing about trust — the node
+        checks the same checksum either way, so this cannot become a way to
+        hand nodes something else.
+        """
+        _auth_point(point, request)
+        if not _relay_cores_enabled():
+            raise HTTPException(403, "core relay is disabled")
+        entry = next((c for c in _core_catalogue() if c["version"] == version), None)
+        if entry is None:
+            raise HTTPException(404, "version is not in the catalogue")
+
+        blob = _core_blobs.get(version)
+        if blob is None:
+            url = CORE_URL.format(version=quote(version, safe=""))
+            try:
+                r = deps.http.get(url, follow_redirects=True, timeout=180.0)
+                r.raise_for_status()
+                blob = r.content
+            except Exception as exc:  # noqa: BLE001 — network, one failure mode
+                raise HTTPException(502, f"could not fetch the release: {exc}") from exc
+            got = hashlib.sha256(blob).hexdigest()
+            if got != entry["sha256"]:
+                # Refuse rather than pass it on: relaying something that fails
+                # the catalogue's own checksum would only waste the node's time
+                # discovering the same thing.
+                raise HTTPException(502, "the release does not match its recorded checksum")
+            _core_blobs[version] = blob
+        return Response(content=blob, media_type="application/zip")
 
     # ── enroll: zero-touch node registration ────────────────────────────────
 
@@ -339,21 +385,21 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             raise HTTPException(502, f"relay unavailable: {exc}") from exc
         if r.status_code >= 400:
             raise HTTPException(502, f"metrics store rejected the write: {r.status_code}")
-        _ = p  # point verified; the body is forwarded as-is
+        db.touch_point(deps.conn, p.name, metrics=True)
         return Response(status_code=204)
 
     # ── admin: points ───────────────────────────────────────────────────────
 
     @admin.get("/api/admin/points")
     def admin_points(_: dict = Depends(require_owner)) -> list[dict]:
-        return [p.public() for p in db.list_points(deps.conn)]
+        return [dict(p.public(), health=_health(p)) for p in db.list_points(deps.conn)]
 
     @admin.get("/api/admin/points/{name}")
     def admin_point(name: str, _: dict = Depends(require_owner)) -> dict:
         p = db.get_point(deps.conn, name)
         if p is None:
             raise HTTPException(404, "point not found")
-        out = p.public()
+        out = dict(p.public(), health=_health(p))
         t = _targets_of(p)
         out["tcp_remarks"] = t.get("tcp") or []
         out["tunnel_remarks"] = t.get("tunnel") or []
@@ -525,6 +571,59 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         _sub_cache[p.name] = (now, configs)
         return configs
 
+    SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+    def _core_catalogue() -> list[dict[str, str]]:
+        raw = db.get_setting(deps.conn, "core_catalogue")
+        return json.loads(raw) if raw else []
+
+    def _relay_cores_enabled() -> bool:
+        return db.get_setting(deps.conn, "core_relay") == "1"
+
+    @admin.post("/api/admin/cores/relay")
+    def set_core_relay(payload: dict[str, Any], _: dict = Depends(require_owner)) -> dict:
+        """Whether this service will fetch cores for nodes that cannot.
+
+        Off by default: it is bandwidth on the owner's machine, and a node
+        that can reach the release has no need of it.
+        """
+        on = bool(payload.get("enabled"))
+        db.set_setting(deps.conn, "core_relay", "1" if on else "0")
+        return {"ok": True, "enabled": on}
+
+    @admin.get("/api/admin/cores")
+    def list_cores(_: dict = Depends(require_owner)) -> dict:
+        return {"cores": _core_catalogue(), "relay": _relay_cores_enabled()}
+
+    @admin.post("/api/admin/cores")
+    def add_core(payload: dict[str, Any], _: dict = Depends(require_owner)) -> dict:
+        """Add a core version to the catalogue.
+
+        The checksum is required and never derived here: it is the whole
+        reason a node may fetch a binary at all, and a checksum this service
+        obtained by itself would prove only that it downloaded the same thing
+        twice.
+        """
+        version = str(payload.get("version") or "").strip()
+        sha = str(payload.get("sha256") or "").strip()
+        if not version:
+            raise HTTPException(400, "version is required")
+        if not SHA256_RE.match(sha):
+            raise HTTPException(400, "sha256 must be 64 hex characters")
+        catalogue = [c for c in _core_catalogue() if c["version"] != version]
+        catalogue.append({"version": version, "sha256": sha.lower()})
+        catalogue.sort(key=lambda c: c["version"])
+        db.set_setting(deps.conn, "core_catalogue", json.dumps(catalogue))
+        return {"ok": True, "cores": catalogue}
+
+    @admin.delete("/api/admin/cores/{version}")
+    def remove_core(version: str, _: dict = Depends(require_owner)) -> dict:
+        catalogue = [c for c in _core_catalogue() if c["version"] != version]
+        db.set_setting(deps.conn, "core_catalogue", json.dumps(catalogue))
+        # Nodes keep a core they already fetched: removing it from the
+        # catalogue stops new fetches, it does not reach onto the nodes.
+        return {"ok": True, "cores": catalogue}
+
     def _auth_point(point: str, request: Request):
         """Verify the point's basic auth and return its row. 401 otherwise."""
         auth = request.headers.get("authorization", "")
@@ -611,6 +710,40 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             h.remark for h in deps.panel.hosts()
             if h.inbound_uuid in inbounds and squad_uuid not in h.excluded and h.remark
         )
+
+    def _health(p: db.Point) -> dict[str, Any]:
+        """Is this probe alive, judged by its own cadence.
+
+        A fixed threshold would be wrong for every point that is not on the
+        default schedule, so the expectation is derived from what this point
+        was actually told to do: it pushes every `push_interval`, so two
+        missed pushes is late and five is off.
+
+        `seen` and `metrics` are separate because they fail apart. A disabled
+        point, or one with every check switched off, keeps polling and sends
+        nothing — that is obedience, not silence, and calling it offline would
+        train the operator to ignore the field.
+        """
+        now = time.time()
+        every = cfg.defaults.push_interval
+        seen_ago = now - p.last_seen_at if p.last_seen_at else None
+        metrics_ago = now - p.last_metrics_at if p.last_metrics_at else None
+        expects_metrics = p.enabled and p.push_enabled and any(p.modes.values())
+
+        if seen_ago is None:
+            state = "never"
+        elif seen_ago > 5 * every:
+            state = "offline"
+        elif not expects_metrics:
+            state = "standing by"
+        elif metrics_ago is None or metrics_ago > 5 * every:
+            state = "no metrics"
+        elif metrics_ago > 2 * every or seen_ago > 2 * every:
+            state = "late"
+        else:
+            state = "online"
+        return {"state": state, "seen_ago": seen_ago, "metrics_ago": metrics_ago,
+                "expect_every": every, "expects_metrics": expects_metrics}
 
     def _targets_of(p: db.Point) -> dict[str, list[str]]:
         """The point's target sets, migrating a legacy point on first read.

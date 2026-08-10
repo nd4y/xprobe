@@ -49,10 +49,13 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
+import io
 import json
 import os
 import random
 import re
+import shutil
 import socket
 import ssl
 import subprocess
@@ -61,6 +64,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -83,17 +87,134 @@ XRAY_DIR = os.environ.get("XRAY_DIR", "/opt/xray")
 MODES = ("tcp", "tunnel", "status", "download")
 
 
+# Cores fetched on demand live beside the rest of the node's state. Written
+# to disk unlike configs — this is vendor code verified against a checksum,
+# not a credential, and it has to be executable to be of any use.
+CORE_CACHE = os.environ.get("CORE_CACHE", "/var/lib/xprobe/cores")
+
+# The ONLY place a core is ever fetched from. Deliberately hardcoded: the
+# control plane names a version and its checksum, never a location, so a
+# compromised control plane can at worst pick a different official release —
+# it cannot turn the fleet into a delivery channel for code of its choosing.
+CORE_URL = "https://github.com/XTLS/Xray-core/releases/download/{version}/Xray-linux-64.zip"
+
+
 def xray_versions() -> dict[str, str]:
-    """Cores available in this image: version -> path."""
+    """Cores this node can run right now: version -> path.
+
+    Both the ones baked into the image and the ones fetched earlier. The image
+    wins: it is the version the operator of this node actually installed.
+    """
     out: dict[str, str] = {}
-    try:
-        for name in sorted(os.listdir(XRAY_DIR)):
-            path = os.path.join(XRAY_DIR, name, "xray")
-            if os.access(path, os.X_OK):
-                out[name] = path
-    except OSError:
-        pass
+    for root in (CORE_CACHE, XRAY_DIR):
+        try:
+            for name in sorted(os.listdir(root)):
+                path = os.path.join(root, name, "xray")
+                if os.access(path, os.X_OK):
+                    out[name] = path
+        except OSError:
+            continue
     return out
+
+
+def fetch_core(version: str, sha256: str, *, control_url: str = "", point: str = "",
+               secret: str = "", relay: bool = False, timeout: int = 180) -> str:
+    """Fetch a core, verify it against the checksum the control plane gave.
+
+    Straight from the official release first; then, only if the control plane
+    enables relaying, through it — a blocked or throttled GitHub is the normal
+    case on some of these networks.
+
+    The relayed path is no weaker than the direct one: the checksum is checked
+    here either way, so a control plane that served something else would be
+    caught rather than obeyed. That is what makes relaying safe to offer at
+    all.
+
+    A mismatch discards the download rather than running it: the checksum is
+    the entire reason this is safe to do, so failing it is fatal, never a
+    warning.
+    """
+    if not sha256:
+        raise ValueError(f"no checksum for xray {version} — refusing to fetch it")
+
+    quoted = urllib.parse.quote(version, safe="")
+    sources = [("the official release", CORE_URL.format(version=quoted), None)]
+    # Relaying is offered only when the control plane says so: it is the
+    # owner's decision whether their service carries this traffic, not the
+    # node's to assume.
+    if relay and control_url and point:
+        sources.append(("the control plane",
+                        f"{control_url.rstrip('/')}/api/points/"
+                        f"{urllib.parse.quote(point)}/core/{quoted}",
+                        (point, secret)))
+
+    blob = None
+    for label, url, auth in sources:
+        req = urllib.request.Request(url)
+        if auth is not None:
+            token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+            req.add_header("Authorization", f"Basic {token}")
+        try:
+            print(f"fetching xray {version} from {label}", flush=True)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                blob = r.read()
+            break
+        except Exception as exc:  # noqa: BLE001 — try the next source
+            print(f"  {label} did not work: {exc}", flush=True)
+    if blob is None:
+        raise OSError(f"xray {version}: no source could be reached")
+
+    got = hashlib.sha256(blob).hexdigest()
+    if got.lower() != sha256.strip().lower():
+        raise ValueError(f"xray {version}: checksum mismatch (got {got[:16]}…)")
+
+    target = os.path.join(CORE_CACHE, version)
+    os.makedirs(target, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(blob)) as z, z.open("xray") as src, \
+            open(os.path.join(target, "xray.part"), "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    path = os.path.join(target, "xray")
+    os.chmod(os.path.join(target, "xray.part"), 0o755)
+    os.replace(os.path.join(target, "xray.part"), path)   # atomic: no half binary
+    print(f"xray {version} ready", flush=True)
+    return path
+
+
+def ensure_cores(catalogue: dict[str, str], wanted: set[str], *, control_url: str = "",
+                 point: str = "", secret: str = "", relay: bool = False) -> None:
+    """Make sure the cores the checks ask for are on this node, and only those.
+
+    A cached core is reused rather than fetched again — that is what the
+    volume is for. Cores nothing asks for any more are deleted: they are tens
+    of megabytes each, and keeping a version around after it stopped being
+    used quietly grows the node's disk for no reason.
+    """
+    have = xray_versions()
+    for version in sorted(wanted):
+        if not version or version in have:
+            continue
+        try:
+            fetch_core(version, catalogue.get(version, ""), control_url=control_url,
+                       point=point, secret=secret, relay=relay)
+        except Exception as exc:  # noqa: BLE001 — network, zip, checksum: all fatal for this core
+            # Not fatal for the probe: the checks that wanted it report
+            # themselves unrunnable, the rest carry on.
+            print(f"xray {version} unavailable: {exc}", flush=True)
+
+    # Only the fetched ones are pruned. What the image carries is not ours to
+    # remove — the operator installed it.
+    try:
+        cached = os.listdir(CORE_CACHE)
+    except OSError:
+        return
+    for version in cached:
+        if version in wanted:
+            continue
+        try:
+            shutil.rmtree(os.path.join(CORE_CACHE, version))
+            print(f"removed unused xray {version}", flush=True)
+        except OSError as exc:
+            print(f"could not remove xray {version}: {exc}", flush=True)
 
 
 def xray_binary(version: str) -> str:
@@ -193,6 +314,14 @@ class Config:
     expectations: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = ()
     labels: tuple[tuple[str, str], ...] = ()
     push: Push | None = None
+    # Cores the control plane says exist, as version -> sha256. Policy, not
+    # payload: the node fetches from a fixed official location and verifies
+    # against this, so the control plane never ships code.
+    core_catalogue: tuple[tuple[str, str], ...] = ()
+    # Whether the control plane is willing to fetch a core on the node's
+    # behalf when the official release cannot be reached. The owner's call:
+    # it is their service that carries the traffic.
+    core_relay: bool = False
 
     # ── from the environment (legacy mode) ────────────────────────────────────
 
@@ -324,8 +453,14 @@ class Config:
                 spool_max_bytes=int(pd.get("spool_max_bytes") or 200 * 1024 * 1024),
             )
 
+        catalogue = tuple(
+            (str(c.get("version")), str(c.get("sha256") or ""))
+            for c in (doc.get("cores") or []) if c.get("version")
+        )
         return cls(
             probes=tuple(probes),
+            core_catalogue=catalogue,
+            core_relay=bool(doc.get("core_relay", False)),
             version=int(doc.get("version") or 0),
             ip_url=str(doc.get("ip_url") or cls.ip_url),
             isp_url=str(doc.get("isp_url") or cls.isp_url),
@@ -1260,6 +1395,14 @@ def main() -> None:
         # Disabled: build_config resolved the identity but built nothing.
         idle_until_enabled(control_url, point, secret, control_interval)
         return
+
+    # Fetch whatever cores the checks ask for and this image does not carry.
+    # Before any thread starts, so a check never runs on a core that is still
+    # being written.
+    ensure_cores(dict(cfg.core_catalogue),
+                 {p.xray_version for p in cfg.probes if p.xray_version},
+                 control_url=control_url, point=point, secret=secret,
+                 relay=cfg.core_relay)
     state = State()
     stop = threading.Event()
 
