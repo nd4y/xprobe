@@ -31,7 +31,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from . import db, sessions
 from .config import Config
-from .document import build_document
+from .document import MODES, build_document
 from .oidc import OIDC, new_state
 from .panel import Panel
 
@@ -209,7 +209,7 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         outside its own set.
         """
         p = _auth_point(point, request)
-        if kind not in ("tcp", "status", "download"):
+        if kind not in MODES:
             raise HTTPException(404, "unknown check")
         if not p.enabled:
             raise HTTPException(404, "point is disabled")
@@ -356,6 +356,7 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         out = p.public()
         t = _targets_of(p)
         out["tcp_remarks"] = t.get("tcp") or []
+        out["tunnel_remarks"] = t.get("tunnel") or []
         out["check_remarks"] = t.get("status") or []
         out["load_remarks"] = t.get("download") or []
         # Targets the point's account cannot actually see, as observed the
@@ -382,6 +383,7 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             raise HTTPException(404, "point not found")
         targets = {
             "tcp": sorted(set(payload.get("tcp_remarks") or [])),
+            "tunnel": sorted(set(payload.get("tunnel_remarks") or [])),
             "status": sorted(set(payload.get("check_remarks") or [])),
             "download": sorted(set(payload.get("load_remarks") or [])),
         }
@@ -622,6 +624,9 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         http = _squad_remarks(p.check_squad)
         return {
             "tcp": _squad_remarks(p.tcp_squad) or http,
+            # tunnel arrived after the squads did; it starts from the http set,
+            # which is the comparison it is meant for.
+            "tunnel": http,
             "status": http,
             "download": _squad_remarks(p.load_squad),
         }

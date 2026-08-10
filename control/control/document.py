@@ -17,13 +17,17 @@ from typing import Any
 from .config import Defaults
 from .db import Point
 
-MODES = ("tcp", "status", "download")
+# The ladder of checks, cheapest first. `tcp` and `tunnel` ask the same
+# question — does the handshake complete — differing only in whether a core
+# is in the path, which is what makes a core implementation change visible.
+MODES = ("tcp", "tunnel", "status", "download")
 
 
 def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> dict[str, Any]:
     d = defaults
     interval_default = {
-        "tcp": d.tcp_interval, "status": d.status_interval, "download": d.download_interval,
+        "tcp": d.tcp_interval, "tunnel": d.tunnel_interval,
+        "status": d.status_interval, "download": d.download_interval,
     }
 
     probes: dict[str, Any] = {}
@@ -42,7 +46,15 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
             "configs_url": (f"{base_url}/api/points/{point.name}/configs/{kind}"
                             if base_url else ""),
         }
-        if kind == "status":
+        if kind == "tunnel":
+            spec["start_port"] = 21000
+            spec["timeout"] = 20
+            # A TLS endpoint: the check completes a handshake through the
+            # tunnel, which is the cheapest exchange that forces real traffic
+            # both ways. Merely opening the connection proves nothing — the
+            # core answers that before it dials anything.
+            spec["url"] = d.tunnel_url
+        elif kind == "status":
             spec["start_port"] = 20000
             spec["timeout"] = 30
             spec["url"] = d.status_url

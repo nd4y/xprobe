@@ -47,9 +47,15 @@ class Defaults:
     # tcp and http run concurrently on the same 5-minute schedule; the
     # bandwidth check every 30 minutes.
     tcp_interval: int = 300
+    # The same schedule as tcp: the two are meant to be read side by side, and
+    # comparing them is only fair on samples taken at the same rate.
+    tunnel_interval: int = 300
     status_interval: int = 300
     download_interval: int = 1800
     status_url: str = "http://cp.cloudflare.com/generate_204"
+    # Where the tunnel check performs its handshake. TLS, because completing
+    # one is what proves the tunnel actually carries traffic.
+    tunnel_url: str = "https://cp.cloudflare.com"
     # The download check is a volume-tolerance test, not a speed test: DPI can
     # let a tunnel open and kill it after N bytes, so what matters is how much
     # gets through. The file therefore has to be at least as large as the

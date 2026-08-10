@@ -55,9 +55,20 @@ def test_disabled_mode_is_served_disabled():
 
 def test_each_check_points_at_its_own_config_endpoint():
     doc = build_document(point(), DEF, base_url=SITE)
-    for kind in ("tcp", "status", "download"):
+    for kind in ("tcp", "tunnel", "status", "download"):
         assert doc["probes"][kind]["configs_url"] == \
             f"{SITE}/api/points/yaroslavl/configs/{kind}"
+
+
+def test_tunnel_runs_a_core_where_tcp_does_not():
+    # The pair only means anything if they differ in exactly one thing: the
+    # core in the path. tunnel therefore takes a version, tcp never does.
+    doc = build_document(point(modes={"tcp": True, "tunnel": True},
+                               cores={"tunnel": "v26.3.27"}), DEF)
+    assert doc["probes"]["tunnel"]["xray_version"] == "v26.3.27"
+    assert doc["probes"]["tcp"]["xray_version"] == ""
+    # And they run on the same schedule, or comparing them would be unfair.
+    assert doc["probes"]["tunnel"]["interval"] == doc["probes"]["tcp"]["interval"]
 
 
 def test_interval_override_lands_in_the_document():

@@ -6,16 +6,21 @@
 // A full page instead of a dialog: the target table is large, and nesting it
 // into a modal produced scroll-in-scroll.
 
-const MODES = ['tcp', 'status', 'download'];
+const MODES = ['tcp', 'tunnel', 'status', 'download'];
 // The wire format and the metric label keep `status` (dashboards depend on
 // it); the UI calls the check `http` — that is what it actually does.
-const MODE_LABEL = { tcp: 'tcp', status: 'http', download: 'download' };
+const MODE_LABEL = { tcp: 'tcp', tunnel: 'tunnel', status: 'http', download: 'download' };
 const MODE_HINT = {
-  tcp: 'connect + TLS handshake to the inbound — the latency floor, before the tunnel',
+  tcp: 'connect + TLS handshake to the inbound, no core involved — the latency floor',
+  tunnel: 'the same handshake performed by a core: differs from tcp only by the core in the path',
   status: 'HTTP request through the config; minus tcp it gives the latency added past the entry',
   download: 'how much data the tunnel lets through before it is cut',
 };
-const DEF_INT = { tcp: 300, status: 300, download: 1800 };
+const DEF_INT = { tcp: 300, tunnel: 300, status: 300, download: 1800 };
+// Which target set each check reads. The names are historical — renaming a
+// live wire field buys nothing.
+const MODE_FIELD = { tcp: 'tcp_remarks', tunnel: 'tunnel_remarks',
+                     status: 'check_remarks', download: 'load_remarks' };
 
 function el(tag, attrs = {}, kids = []) {
   const n = document.createElement(tag);
@@ -274,9 +279,7 @@ async function pointView(name) {
 
   // — targets: one table, a checkbox column per check —
   const sels = {
-    tcp: new Set(p.tcp_remarks || []),
-    status: new Set(p.check_remarks || []),
-    download: new Set(p.load_remarks || []),
+    ...Object.fromEntries(MODES.map((m) => [m, new Set(p[MODE_FIELD[m]] || [])])),
   };
   const search = el('input', { type: 'search', placeholder: 'Filter hosts…' });
   const tbody = el('tbody');
@@ -388,8 +391,7 @@ async function pointView(name) {
       });
       await api(`/admin/points/${encodeURIComponent(name)}/set`, {
         method: 'POST',
-        body: { tcp_remarks: [...sels.tcp], check_remarks: [...sels.status],
-                load_remarks: [...sels.download] },
+        body: Object.fromEntries(MODES.map((m) => [MODE_FIELD[m], [...sels[m]]])),
       });
       toast('Saved — the probe restarts with the new version');
       await pointView(name);

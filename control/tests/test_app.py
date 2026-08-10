@@ -251,13 +251,14 @@ def test_configs_endpoint_returns_only_the_check_s_targets(tmp_path):
     db.rotate_secret(deps.conn, "yar", secret)
 
     got = {}
-    for kind in ("tcp", "status", "download"):
+    for kind in ("tcp", "tunnel", "status", "download"):
         r = points.get(f"/api/points/yar/configs/{kind}", headers=basic("yar", secret))
         assert r.status_code == 200, r.text
         got[kind] = [c["remarks"] for c in r.json()]
     assert got["tcp"] == ["RU · TLS", "RU · XHTTP"]
     assert got["status"] == ["RU · TLS"]
     assert got["download"] == ["RU · XHTTP"]
+    assert got["tunnel"] == []          # not asked for, so not probed
 
 
 def test_a_target_the_account_cannot_see_is_reported(tmp_path):
@@ -353,7 +354,8 @@ def test_saving_targets_writes_nothing_to_the_panel(tmp_path):
     assert [list(s.inbounds) for s in panel.squads_] == before
     assert [(h.uuid, list(h.excluded)) for h in panel.hosts_] == hosts_before
     p = db.get_point(deps.conn, "yar")
-    assert p.targets == {"tcp": ["RU · TLS"], "status": ["RU · XHTTP"], "download": []}
+    assert p.targets == {"tcp": ["RU · TLS"], "tunnel": [],
+                         "status": ["RU · XHTTP"], "download": []}
 
 
 def test_malformed_point_name_is_rejected(tmp_path):

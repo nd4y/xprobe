@@ -3,11 +3,12 @@
 Distributed availability monitoring for [Remnawave](https://remna.st)
 deployments: lightweight probes at many vantage points, one control plane.
 
-Every probe brings each subscription config up with a **real `xray` binary**
-(pinned to your node version — no silent XHTTP incompatibilities), verifies
-the **exit address** (a dead WARP masked by a DIRECT fallback stays invisible
-to ordinary checkers), and reports **at which stage** a config broke: network,
-TLS handshake, protocol, or bandwidth.
+Every probe brings each subscription config up with a **real `xray` binary** —
+and with the core version you choose, per check, because a config that works
+on one core can fail silently on another. It verifies the **exit address** (a
+dead WARP masked by a DIRECT fallback stays invisible to ordinary checkers)
+and reports **at which stage** a config broke: network, TLS handshake, tunnel,
+protocol, or bandwidth.
 
 The control plane makes the fleet manageable: which probe checks which
 servers, in which modes, at what intervals — all edited centrally, applied to
