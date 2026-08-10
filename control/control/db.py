@@ -10,14 +10,40 @@ data, and duplicating them would create a second answer to the same question.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import json
 import secrets
 import sqlite3
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+# One connection is shared by the whole service, and the web framework runs
+# every synchronous handler in a thread pool — so two requests genuinely land
+# on it at the same time. `check_same_thread=False` only lifts sqlite3's
+# refusal to be used across threads; it does NOT make the connection safe to
+# use concurrently, and a read racing a write raises
+# `InterfaceError: bad parameter or other API misuse` — an error that reads
+# like a bug in the query rather than what it is.
+#
+# Every function here therefore takes this lock for its whole body, fetches
+# included: holding it only for `execute()` would still let another thread
+# reset the statement before the rows are read. The fleet is tens of points,
+# so serialising database access costs nothing measurable.
+_LOCK = threading.RLock()
+
+
+def _serialized[F: Callable[..., Any]](fn: F) -> F:
+    @functools.wraps(fn)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        with _LOCK:
+            return fn(*args, **kwargs)
+    return guarded  # type: ignore[return-value]
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS points (
@@ -178,6 +204,7 @@ class Point:
         }
 
 
+@_serialized
 def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -242,25 +269,30 @@ def _row_to_point(r: sqlite3.Row) -> Point:
     )
 
 
+@_serialized
 def get_point_by_node(conn: sqlite3.Connection, node_id: str) -> Point | None:
     r = conn.execute("SELECT * FROM points WHERE node_id = ?", (node_id,)).fetchone()
     return _row_to_point(r) if r else None
 
 
+@_serialized
 def get_point(conn: sqlite3.Connection, name: str) -> Point | None:
     r = conn.execute("SELECT * FROM points WHERE name = ?", (name,)).fetchone()
     return _row_to_point(r) if r else None
 
 
+@_serialized
 def get_secret_hash(conn: sqlite3.Connection, name: str) -> str | None:
     r = conn.execute("SELECT secret_hash FROM points WHERE name = ?", (name,)).fetchone()
     return r["secret_hash"] if r else None
 
 
+@_serialized
 def list_points(conn: sqlite3.Connection) -> list[Point]:
     return [_row_to_point(r) for r in conn.execute("SELECT * FROM points ORDER BY name")]
 
 
+@_serialized
 def create_point(conn: sqlite3.Connection, point: Point, secret: str) -> None:
     conn.execute(
         """INSERT INTO points
@@ -297,6 +329,7 @@ EDITABLE = {
 _JSON_FIELDS = {"modes", "intervals", "exit_expectations", "targets", "cores"}
 
 
+@_serialized
 def update_point(conn: sqlite3.Connection, name: str, changes: dict[str, Any]) -> int:
     """Update point fields and bump the version. Returns the new version."""
     fields = {k: v for k, v in changes.items() if k in EDITABLE}
@@ -320,18 +353,21 @@ def update_point(conn: sqlite3.Connection, name: str, changes: dict[str, Any]) -
     return r["version"] if r else 0
 
 
+@_serialized
 def rotate_secret(conn: sqlite3.Connection, name: str, secret: str) -> None:
     conn.execute("UPDATE points SET secret_hash = ?, version = version + 1 WHERE name = ?",
                  (hash_secret(secret), name))
     conn.commit()
 
 
+@_serialized
 def delete_point(conn: sqlite3.Connection, name: str) -> bool:
     cur = conn.execute("DELETE FROM points WHERE name = ?", (name,))
     conn.commit()
     return cur.rowcount > 0
 
 
+@_serialized
 def touch_point(conn: sqlite3.Connection, name: str, *, metrics: bool = False) -> None:
     """Record that the probe was heard from. Does NOT bump the version — the
     point has not changed, we merely learned it is alive."""
@@ -344,6 +380,7 @@ def touch_point(conn: sqlite3.Connection, name: str, *, metrics: bool = False) -
     conn.commit()
 
 
+@_serialized
 def update_xray_versions(conn: sqlite3.Connection, name: str, versions: list[str]) -> None:
     """What the probe says it carries. Reported, never configured — and it does
     not bump the version: learning about the image is not a config change."""
@@ -352,6 +389,7 @@ def update_xray_versions(conn: sqlite3.Connection, name: str, versions: list[str
     conn.commit()
 
 
+@_serialized
 def update_geo(conn: sqlite3.Connection, name: str, *, country: str, city: str,
                isp: str, ip: str) -> None:
     """Geo as reported by the probe. Does NOT bump the version: the node's
@@ -395,6 +433,7 @@ class EnrollToken:
         }
 
 
+@_serialized
 def create_enroll_token(conn: sqlite3.Connection, secret: str, *, label: str = "",
                         point: str = "") -> EnrollToken:
     token = EnrollToken(id=secrets.token_hex(4), label=label, point=point,
@@ -414,11 +453,13 @@ def _row_to_token(r: sqlite3.Row) -> EnrollToken:
         last_node_id=r["last_node_id"])
 
 
+@_serialized
 def list_enroll_tokens(conn: sqlite3.Connection) -> list[EnrollToken]:
     return [_row_to_token(r) for r in
             conn.execute("SELECT * FROM enroll_tokens ORDER BY created_at DESC")]
 
 
+@_serialized
 def find_enroll_token(conn: sqlite3.Connection, secret: str) -> EnrollToken | None:
     """The token presented by a node, if it is one of ours and still valid.
 
@@ -433,28 +474,33 @@ def find_enroll_token(conn: sqlite3.Connection, secret: str) -> EnrollToken | No
     return None
 
 
+@_serialized
 def bind_enroll_token(conn: sqlite3.Connection, token_id: str, point: str) -> None:
     conn.execute("UPDATE enroll_tokens SET point = ? WHERE id = ?", (point, token_id))
     conn.commit()
 
 
+@_serialized
 def touch_enroll_token(conn: sqlite3.Connection, token_id: str, node_id: str) -> None:
     conn.execute("UPDATE enroll_tokens SET last_used_at = ?, last_node_id = ? WHERE id = ?",
                  (time.time(), node_id, token_id))
     conn.commit()
 
 
+@_serialized
 def revoke_enroll_token(conn: sqlite3.Connection, token_id: str) -> bool:
     cur = conn.execute("UPDATE enroll_tokens SET revoked = 1 WHERE id = ?", (token_id,))
     conn.commit()
     return cur.rowcount > 0
 
 
+@_serialized
 def get_setting(conn: sqlite3.Connection, key: str) -> str | None:
     r = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     return r["value"] if r else None
 
 
+@_serialized
 def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.execute(
         "INSERT INTO settings(key, value) VALUES(?, ?) "
