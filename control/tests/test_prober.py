@@ -53,6 +53,27 @@ def test_enabled_mode_without_subscription_is_an_error():
         prober.Config.from_document(bad, point="p", push_password="t")
 
 
+def test_timing_camouflage_reaches_the_probes():
+    # Without jitter and spread a round is a burst of handshakes on the dot,
+    # in a fixed order — the clearest machine signature the probe emits.
+    doc = dict(DOC, jitter=0.3, spread=0.4)
+    cfg = prober.Config.from_document(doc, point="p", push_password="t")
+    assert all(p.jitter == 0.3 and p.spread == 0.4 for p in cfg.probes)
+    # Absent from the document — sane defaults, never zero.
+    plain = prober.Config.from_document(DOC, point="p", push_password="t")
+    assert all(p.jitter > 0 and p.spread > 0 for p in plain.probes)
+
+
+def test_volume_settings_are_read_from_the_document():
+    doc = dict(DOC, probes=dict(DOC["probes"],
+                                download={"enabled": True, "subscription": "load",
+                                          "url": "https://host/10Mb.dat",
+                                          "min_bytes": 10 * 1024**2}))
+    cfg = prober.Config.from_document(doc, point="p", push_password="t")
+    dl = next(p for p in cfg.probes if p.kind == "download")
+    assert dl.url == "https://host/10Mb.dat" and dl.min_bytes == 10 * 1024**2
+
+
 def test_no_enabled_modes_is_an_error():
     bad = dict(DOC, probes={"tcp": {"enabled": False}})
     with pytest.raises(ValueError, match="no enabled modes"):

@@ -50,8 +50,18 @@ class Defaults:
     status_interval: int = 300
     download_interval: int = 1800
     status_url: str = "http://cp.cloudflare.com/generate_204"
+    # The download check is a volume-tolerance test, not a speed test: DPI can
+    # let a tunnel open and kill it after N bytes, so what matters is how much
+    # gets through. The file therefore has to be at least as large as the
+    # volume worth proving, and the source is per-deployment.
     download_url: str = "https://proof.ovh.net/files/1Mb.dat"
     download_min_bytes: int = 524288
+    # Timing camouflage applied to every check: the round period varies by
+    # ±jitter and the configs of one round are scattered over `spread` of it.
+    # A probe firing on the dot in a fixed order is trivially distinguishable
+    # from a person using the same tunnels.
+    jitter: float = 0.2
+    spread: float = 0.5
     ip_url: str = "https://api.ipify.org"
     # Ask for the point's whole location at once: country, city, ISP and its
     # own address. Without country/city/query the probe would get the ISP

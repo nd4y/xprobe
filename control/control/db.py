@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS points (
     tcp_sub_url       TEXT NOT NULL DEFAULT '',
     modes             TEXT NOT NULL DEFAULT '{}',   -- {"tcp":true,...}
     intervals         TEXT NOT NULL DEFAULT '{}',   -- per-check interval overrides
+    download_url      TEXT NOT NULL DEFAULT '',     -- volume test source, empty = fleet default
+    download_min_bytes INTEGER NOT NULL DEFAULT 0,  -- volume that must get through
     exit_expectations TEXT NOT NULL DEFAULT '',     -- json or empty (fleet defaults)
     push_enabled      INTEGER NOT NULL DEFAULT 1,
     enabled           INTEGER NOT NULL DEFAULT 1,
@@ -87,6 +89,11 @@ class Point:
     tcp_sub_url: str = ""
     modes: dict[str, bool] = None  # type: ignore[assignment]
     intervals: dict[str, int] = None  # type: ignore[assignment]
+    # Volume-tolerance test settings; empty/0 means the fleet default. Per
+    # point because how much a network lets through is a property of that
+    # network, not of the fleet.
+    download_url: str = ""
+    download_min_bytes: int = 0
     exit_expectations: dict[str, str] | None = None
     push_enabled: bool = True
     enabled: bool = True
@@ -116,6 +123,8 @@ class Point:
             "tcp_squad": self.tcp_squad,
             "has_check_sub": bool(self.check_sub_url), "has_load_sub": bool(self.load_sub_url),
             "modes": self.modes, "intervals": self.intervals,
+            "download_url": self.download_url,
+            "download_min_bytes": self.download_min_bytes,
             "exit_expectations": self.exit_expectations,
             "push_enabled": self.push_enabled, "enabled": self.enabled,
             "auto": bool(self.node_id), "version": self.version, "note": self.note,
@@ -130,9 +139,11 @@ def connect(path: str) -> sqlite3.Connection:
     # older versions lack its columns. CREATE IF NOT EXISTS does not extend
     # an existing table, so add them here.
     have = {r["name"] for r in conn.execute("PRAGMA table_info(points)")}
-    for col in ("tcp_account", "tcp_squad", "tcp_sub_url"):
+    for col in ("tcp_account", "tcp_squad", "tcp_sub_url", "download_url"):
         if col not in have:
             conn.execute(f"ALTER TABLE points ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    if "download_min_bytes" not in have:
+        conn.execute("ALTER TABLE points ADD COLUMN download_min_bytes INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -165,6 +176,7 @@ def _row_to_point(r: sqlite3.Row) -> Point:
         check_sub_url=r["check_sub_url"], load_sub_url=r["load_sub_url"],
         tcp_sub_url=r["tcp_sub_url"],
         modes=json.loads(r["modes"] or "{}"), intervals=json.loads(r["intervals"] or "{}"),
+        download_url=r["download_url"], download_min_bytes=r["download_min_bytes"],
         exit_expectations=json.loads(r["exit_expectations"]) if r["exit_expectations"] else None,
         push_enabled=bool(r["push_enabled"]), enabled=bool(r["enabled"]),
         version=r["version"], note=r["note"], created_at=r["created_at"],
@@ -196,14 +208,16 @@ def create_point(conn: sqlite3.Connection, point: Point, secret: str) -> None:
            (name, secret_hash, node_id, vantage, country, city, isp, ip, pin_geo,
             check_account, load_account, tcp_account, check_squad, load_squad,
             tcp_squad, check_sub_url, load_sub_url, tcp_sub_url, modes, intervals,
-            exit_expectations, push_enabled, enabled, version, note, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            download_url, download_min_bytes, exit_expectations, push_enabled,
+            enabled, version, note, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (point.name, hash_secret(secret), point.node_id or None, point.vantage,
          point.country, point.city, point.isp, point.ip, int(point.pin_geo),
          point.check_account, point.load_account, point.tcp_account,
          point.check_squad, point.load_squad, point.tcp_squad,
          point.check_sub_url, point.load_sub_url, point.tcp_sub_url,
          json.dumps(point.modes), json.dumps(point.intervals),
+         point.download_url, point.download_min_bytes,
          json.dumps(point.exit_expectations) if point.exit_expectations else "",
          int(point.push_enabled), int(point.enabled), 1, point.note, time.time()),
     )
@@ -217,6 +231,7 @@ EDITABLE = {
     "tcp_squad", "check_sub_url", "load_sub_url", "tcp_sub_url", "modes",
     "intervals", "exit_expectations", "push_enabled", "enabled", "note",
     "check_account", "load_account", "tcp_account",
+    "download_url", "download_min_bytes",
 }
 _JSON_FIELDS = {"modes", "intervals", "exit_expectations"}
 
