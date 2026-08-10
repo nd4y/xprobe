@@ -29,6 +29,11 @@ receives its identity and target set, detects its own city/ISP, and starts
 pushing metrics through the control-plane relay. Everything else is managed
 from the control-plane UI.
 
+The token is issued **per node** and can be revoked for that node alone —
+without it, cutting one operator off would mean re-keying every other one.
+It also doubles as the node's identity, so nothing has to be persisted: a
+rescheduled pod on an `emptyDir` re-enrolls as the same point.
+
 ## Security model
 
 Probes run on machines their operator does not own, and every config they

@@ -56,6 +56,21 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- One token per node, not one for the fleet. A fleet-wide token cannot be
+-- taken back from one operator: disabling their point only stops that point,
+-- while the token still lets them enroll a fresh one. Revoking here ends that
+-- node's access and touches nobody else.
+CREATE TABLE IF NOT EXISTS enroll_tokens (
+    id           TEXT PRIMARY KEY,            -- short, for referring to it in the UI
+    token_hash   TEXT NOT NULL,               -- the token itself is never stored
+    label        TEXT NOT NULL DEFAULT '',    -- whose node this is
+    point        TEXT NOT NULL DEFAULT '',    -- bound on first use
+    revoked      INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL DEFAULT 0,
+    last_used_at REAL NOT NULL DEFAULT 0,
+    last_node_id TEXT NOT NULL DEFAULT ''     -- diagnostic: spots a shared token
+);
 """
 
 
@@ -305,6 +320,80 @@ def update_geo(conn: sqlite3.Connection, name: str, *, country: str, city: str,
 
 
 # ── settings (enroll token) ──────────────────────────────────────────────────
+
+
+@dataclass
+class EnrollToken:
+    id: str
+    label: str = ""
+    point: str = ""
+    revoked: bool = False
+    created_at: float = 0.0
+    last_used_at: float = 0.0
+    last_node_id: str = ""
+
+    def public(self) -> dict[str, Any]:
+        """Never carries the token — only its hash is stored anyway."""
+        return {
+            "id": self.id, "label": self.label, "point": self.point,
+            "revoked": self.revoked, "created_at": self.created_at,
+            "last_used_at": self.last_used_at, "used": bool(self.last_used_at),
+        }
+
+
+def create_enroll_token(conn: sqlite3.Connection, secret: str, *, label: str = "",
+                        point: str = "") -> EnrollToken:
+    token = EnrollToken(id=secrets.token_hex(4), label=label, point=point,
+                        created_at=time.time())
+    conn.execute(
+        "INSERT INTO enroll_tokens(id, token_hash, label, point, created_at) "
+        "VALUES(?,?,?,?,?)",
+        (token.id, hash_secret(secret), label, point, token.created_at))
+    conn.commit()
+    return token
+
+
+def _row_to_token(r: sqlite3.Row) -> EnrollToken:
+    return EnrollToken(
+        id=r["id"], label=r["label"], point=r["point"], revoked=bool(r["revoked"]),
+        created_at=r["created_at"], last_used_at=r["last_used_at"],
+        last_node_id=r["last_node_id"])
+
+
+def list_enroll_tokens(conn: sqlite3.Connection) -> list[EnrollToken]:
+    return [_row_to_token(r) for r in
+            conn.execute("SELECT * FROM enroll_tokens ORDER BY created_at DESC")]
+
+
+def find_enroll_token(conn: sqlite3.Connection, secret: str) -> EnrollToken | None:
+    """The token presented by a node, if it is one of ours and still valid.
+
+    Every row is checked because only hashes are stored — there are tens of
+    tokens at most, and a lookup that cannot be done by index is a small price
+    for not keeping the tokens themselves.
+    """
+    for r in conn.execute("SELECT * FROM enroll_tokens"):
+        if check_secret(secret, r["token_hash"]):
+            token = _row_to_token(r)
+            return None if token.revoked else token
+    return None
+
+
+def bind_enroll_token(conn: sqlite3.Connection, token_id: str, point: str) -> None:
+    conn.execute("UPDATE enroll_tokens SET point = ? WHERE id = ?", (point, token_id))
+    conn.commit()
+
+
+def touch_enroll_token(conn: sqlite3.Connection, token_id: str, node_id: str) -> None:
+    conn.execute("UPDATE enroll_tokens SET last_used_at = ?, last_node_id = ? WHERE id = ?",
+                 (time.time(), node_id, token_id))
+    conn.commit()
+
+
+def revoke_enroll_token(conn: sqlite3.Connection, token_id: str) -> bool:
+    cur = conn.execute("UPDATE enroll_tokens SET revoked = 1 WHERE id = ?", (token_id,))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def get_setting(conn: sqlite3.Connection, key: str) -> str | None:

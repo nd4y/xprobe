@@ -94,17 +94,14 @@ probe reconnects with **nothing persisted at all**: the volume then holds only
 the metrics spool and the document cache, and losing them costs undelivered
 samples and one extra fetch.
 
-Enrolment is different. The control plane recognises a returning node by its
-`NODE_ID`, so that value has to survive a restart — otherwise each restart
-enrols a **brand new point**, and the fleet grows a duplicate (plus a panel
-account) every time. By default the id is generated once and kept in the
-volume, which is enough for Docker.
+Enrolment is the same story: the token is issued per node, is bound to a point
+on first use, and lives in the environment — so a node that comes back without
+its storage presents the same token and gets the same point with a fresh
+secret. An `emptyDir` is enough.
 
-On Kubernetes an `emptyDir` disappears when the pod is rescheduled, so pin the
-id instead: run a StatefulSet and take `NODE_ID` from the pod name via the
-downward API. The name is stable, re-enrolment returns the same point, and no
-storage is needed. The control plane's enrol dialog hands out exactly that
-manifest.
+`NODE_ID` is recorded when enrolling, but it is not the identity — it only
+shows in the control plane which node last used a token, which is how a token
+accidentally shared between two machines becomes visible.
 
 Configs come from the control plane too, already filtered to this point's
 target set, and are **held in memory only** — they carry working credentials

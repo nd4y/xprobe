@@ -231,33 +231,45 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
 
     @points.post("/api/enroll")
     def enroll(payload: dict[str, Any]) -> dict[str, Any]:
-        """A node registers with a one-time token and receives its identity.
+        """A node presents its own token and receives its point's identity.
 
-        The token is fleet-wide and rotatable: regenerating it revokes the old
-        one. The token is exchanged for the point's permanent identity (name +
-        secret) bound to the node's `node_id`; re-enrolling the same node (e.g.
-        after losing the volume) returns the same point with a fresh secret.
-        From then on the node authenticates with the secret, not the token.
+        One token per node, not one for the fleet: a fleet-wide token cannot
+        be taken back from a single operator, because disabling their point
+        still leaves them able to enroll a fresh one. Revoking this token ends
+        that node's access and nobody else's.
+
+        The token is bound to a point on first use, so re-enrolling — which is
+        what a node on storage that does not survive a restart does every time
+        it comes back — returns the same point with a fresh secret. From then
+        on the node works with the secret; the token is only ever used to get
+        a new one.
         """
-        if payload.get("token") != _enroll_token():
-            raise HTTPException(403, "invalid enroll token")
+        presented = str(payload.get("token") or "")
+        token = db.find_enroll_token(deps.conn, presented) if presented else None
+        if token is None:
+            raise HTTPException(403, "enroll token is invalid or revoked")
         node_id = str(payload.get("node_id") or "").strip()
-        if not node_id:
-            raise HTTPException(400, "node_id is required")
         geo = payload.get("geo") or {}
         secret = secrets.token_urlsafe(24)
 
-        existing = db.get_point_by_node(deps.conn, node_id)
-        if existing is not None:
+        if token.point:
+            existing = db.get_point(deps.conn, token.point)
+            if existing is None:
+                # The point was deleted but the token was not: refuse rather
+                # than quietly provisioning a replacement the owner did not ask
+                # for. Revoking the token is the deliberate way to end this.
+                raise HTTPException(409, "the point this token belongs to no longer exists")
             db.rotate_secret(deps.conn, existing.name, secret)
+            db.touch_enroll_token(deps.conn, token.id, node_id)
+            log.info("enroll: %s re-enrolled with token %s", existing.name, token.id)
             return {"point": existing.name, "secret": secret}
 
-        # New node: name from the city (if the probe reported one) or from the
-        # node_id, suffixed for uniqueness. The geo report will refine it.
-        base = _slug(geo.get("city") or "") or f"node-{node_id[:6]}"
+        # First use of an unbound token: name from the city the probe reported,
+        # or from the token's label.
+        base = _slug(geo.get("city") or "") or _slug(token.label) or f"node-{token.id}"
         name = _unique_name(base)
         # Its own account in the shared squad — exactly like manual
-        # provisioning, so an auto-enrolled node can be cut off on its own.
+        # provisioning, so an enrolled node can be cut off on its own.
         prov = _provision(name, {
             "tcp": list(cfg.default_check_remarks),
             "status": list(cfg.default_check_remarks),
@@ -268,11 +280,13 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             country=str(geo.get("country") or ""), city=str(geo.get("city") or ""),
             isp=str(geo.get("isp") or ""), ip=str(geo.get("ip") or ""),
             modes={"tcp": True, "status": True, "download": False},
-            note="enrolled automatically",
+            note=f"enrolled with token {token.id}" + (f" ({token.label})" if token.label else ""),
             **prov,
         )
         db.create_point(deps.conn, point, secret)
-        log.info("enroll: new point %s (node %s)", name, node_id[:8])
+        db.bind_enroll_token(deps.conn, token.id, name)
+        db.touch_enroll_token(deps.conn, token.id, node_id)
+        log.info("enroll: new point %s from token %s", name, token.id)
         return {"point": name, "secret": secret}
 
     @points.post("/api/points/{point}/geo")
@@ -442,21 +456,41 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
 
     # ── enroll token: show and rotate ───────────────────────────────────────
 
-    @admin.get("/api/admin/enroll-token")
-    def show_token(_: dict = Depends(require_owner)) -> dict:
-        # control_url is the PUBLIC points URL: the admin UI runs on another
-        # host, so its own origin would be wrong in the operator's .env.
-        return {"token": _enroll_token(), "control_url": cfg.base_url,
-                "kubectl": _enroll_manifest(_enroll_token())}
+    @admin.get("/api/admin/enroll-tokens")
+    def list_tokens(_: dict = Depends(require_owner)) -> list[dict]:
+        return [t.public() for t in db.list_enroll_tokens(deps.conn)]
 
-    @admin.post("/api/admin/enroll-token/rotate")
-    def rotate_token(_: dict = Depends(require_owner)) -> dict:
-        # Regeneration revokes the old token: already-enrolled nodes are not
-        # affected (they authenticate with their secrets), while a new enroll
-        # with the old token will fail.
-        token = secrets.token_urlsafe(24)
-        db.set_setting(deps.conn, "enroll_token", token)
-        return {"token": token}
+    @admin.post("/api/admin/enroll-tokens")
+    def issue_token(payload: dict[str, Any], _: dict = Depends(require_owner)) -> dict:
+        """Issue a token for one node. Shown once; only its hash is kept.
+
+        Binding it to an existing point is the usual case — the point is set
+        up here first, and the operator gets a credential that can only ever
+        be that point.
+        """
+        point = str(payload.get("point") or "").strip()
+        if point and db.get_point(deps.conn, point) is None:
+            raise HTTPException(404, "point not found")
+        secret = secrets.token_urlsafe(24)
+        token = db.create_enroll_token(deps.conn, secret,
+                                       label=str(payload.get("label") or ""), point=point)
+        return {"ok": True, "id": token.id, "token": secret,
+                "control_url": cfg.base_url,
+                "env": f"CONTROL_URL={cfg.base_url}\nENROLL_TOKEN={secret}",
+                "kubectl": _enroll_manifest(secret),
+                "hint": "the token is shown only once"}
+
+    @admin.post("/api/admin/enroll-tokens/{token_id}/revoke")
+    def revoke_token(token_id: str, _: dict = Depends(require_owner)) -> dict:
+        """End one node's ability to enroll. Others are untouched.
+
+        The point keeps running on the secret it already holds — revoking the
+        token stops it coming back, not what is happening now. Disable the
+        point as well to stop it immediately.
+        """
+        if not db.revoke_enroll_token(deps.conn, token_id):
+            raise HTTPException(404, "token not found")
+        return {"ok": True}
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -473,14 +507,6 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         configs = deps.panel.subscription(p.check_sub_url)
         _sub_cache[p.name] = (now, configs)
         return configs
-
-    def _enroll_token() -> str:
-        token = db.get_setting(deps.conn, "enroll_token")
-        if not token:
-            # First access: seed the token so enrolling works right away.
-            token = secrets.token_urlsafe(24)
-            db.set_setting(deps.conn, "enroll_token", token)
-        return token
 
     def _auth_point(point: str, request: Request):
         """Verify the point's basic auth and return its row. 401 otherwise."""
@@ -588,21 +614,19 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
     def _enroll_manifest(token: str) -> str:
         """Zero-touch on Kubernetes, with nothing persisted.
 
-        A StatefulSet rather than a Deployment, and NODE_ID taken from the pod
-        name: enrolment identifies a node by NODE_ID, so it has to survive a
-        restart. An emptyDir does not survive rescheduling, and a random id
-        would enroll a brand new point every time the pod moved. A
-        StatefulSet's pod name is stable, so re-enrolment returns the same
-        point and the fleet stays the size it should be.
+        The token is the node's identity, and it lives in the manifest — so a
+        rescheduled pod re-enrolls as the same point and an emptyDir is
+        enough. (This is why the token is per node: it is a credential the
+        node keeps, and one that can be taken back from that node alone.)
         """
         url = cfg.base_url or "https://<control-url>"
         return f"""cat <<'EOF' | kubectl apply -f -
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: xprobe
+  labels: {{ app: xprobe }}
 spec:
-  serviceName: xprobe
   replicas: 1
   selector: {{ matchLabels: {{ app: xprobe }} }}
   template:
@@ -614,10 +638,6 @@ spec:
           env:
             - {{ name: CONTROL_URL, value: "{url}" }}
             - {{ name: ENROLL_TOKEN, value: "{token}" }}
-            # Stable across restarts and rescheduling — this is what keeps
-            # the node one point instead of a new one each time.
-            - name: NODE_ID
-              valueFrom: {{ fieldRef: {{ fieldPath: metadata.name }} }}
           volumeMounts:
             - {{ name: data, mountPath: /var/lib/xprobe }}
       volumes:
