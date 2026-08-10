@@ -42,10 +42,20 @@ def test_disabled_mode_is_served_disabled():
     assert doc["probes"]["tcp"]["enabled"] is True
 
 
-def test_download_reads_the_load_subscription():
-    doc = build_document(point(), DEF)
+def test_each_check_reads_its_own_subscription():
+    doc = build_document(point(tcp_sub_url="https://sub/tcp"), DEF)
     assert doc["probes"]["download"]["subscription"] == "load"
     assert doc["probes"]["status"]["subscription"] == "check"
+    assert doc["probes"]["tcp"]["subscription"] == "tcp"
+    assert doc["subscriptions"]["tcp"] == "https://sub/tcp"
+
+
+def test_tcp_falls_back_to_the_http_subscription_when_unset():
+    # A point provisioned before the tcp set existed has no tcp subscription;
+    # tcp then reads the http (check) set rather than nothing.
+    doc = build_document(point(), DEF)
+    assert "tcp" not in doc["subscriptions"]
+    assert doc["probes"]["tcp"]["subscription"] == "check"
 
 
 def test_interval_override_lands_in_the_document():

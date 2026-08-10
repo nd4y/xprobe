@@ -136,7 +136,7 @@ class Config:
             probes.append(Probe(
                 kind="tcp",
                 subscription_url=env("TCP_SUBSCRIPTION_URL"),
-                interval=env_int("TCP_INTERVAL", 120),
+                interval=env_int("TCP_INTERVAL", 300),
                 start_port=0,          # no Xray is started for this mode at all
                 timeout=env_int("TCP_TIMEOUT", 10),
                 url="",
@@ -146,7 +146,7 @@ class Config:
             probes.append(Probe(
                 kind="status",
                 subscription_url=env("SUBSCRIPTION_URL"),
-                interval=env_int("CHECK_INTERVAL", 900),
+                interval=env_int("CHECK_INTERVAL", 300),
                 start_port=env_int("START_PORT", 20000),
                 timeout=env_int("TIMEOUT", 30),
                 url=env("CHECK_URL") or "http://cp.cloudflare.com/generate_204",
@@ -198,8 +198,8 @@ class Config:
         """
         subs = doc.get("subscriptions") or {}
         defaults = {
-            "tcp": {"interval": 120, "timeout": 10, "start_port": 0, "subscription": "check"},
-            "status": {"interval": 900, "timeout": 30, "start_port": 20000,
+            "tcp": {"interval": 300, "timeout": 10, "start_port": 0, "subscription": "check"},
+            "status": {"interval": 300, "timeout": 30, "start_port": 20000,
                        "subscription": "check", "url": "http://cp.cloudflare.com/generate_204"},
             "download": {"interval": 1800, "timeout": 60, "start_port": 20500,
                          "subscription": "load", "min_bytes": 524288,

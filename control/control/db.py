@@ -30,12 +30,15 @@ CREATE TABLE IF NOT EXISTS points (
     isp               TEXT NOT NULL DEFAULT '',
     ip                TEXT NOT NULL DEFAULT '',    -- stored, NEVER exposed
     pin_geo           INTEGER NOT NULL DEFAULT 0,  -- geo pinned by the administrator
-    check_account     TEXT NOT NULL DEFAULT '',
+    check_account     TEXT NOT NULL DEFAULT '',    -- the http check's account/squad/link
     load_account      TEXT NOT NULL DEFAULT '',
+    tcp_account       TEXT NOT NULL DEFAULT '',
     check_squad       TEXT NOT NULL DEFAULT '',
     load_squad        TEXT NOT NULL DEFAULT '',
+    tcp_squad         TEXT NOT NULL DEFAULT '',
     check_sub_url     TEXT NOT NULL DEFAULT '',
     load_sub_url      TEXT NOT NULL DEFAULT '',
+    tcp_sub_url       TEXT NOT NULL DEFAULT '',
     modes             TEXT NOT NULL DEFAULT '{}',   -- {"tcp":true,...}
     intervals         TEXT NOT NULL DEFAULT '{}',   -- per-check interval overrides
     exit_expectations TEXT NOT NULL DEFAULT '',     -- json or empty (fleet defaults)
@@ -70,12 +73,18 @@ class Point:
     # self-detection. When unset, whatever the probe detected is shown
     # (country/city/isp above).
     pin_geo: bool = False
+    # Three independent target sets, one per check: check_* feeds http,
+    # tcp_* feeds tcp, load_* feeds download. (check_* kept its historical
+    # name — renaming a live sqlite column buys nothing.)
     check_account: str = ""
     load_account: str = ""
+    tcp_account: str = ""
     check_squad: str = ""
     load_squad: str = ""
+    tcp_squad: str = ""
     check_sub_url: str = ""
     load_sub_url: str = ""
+    tcp_sub_url: str = ""
     modes: dict[str, bool] = None  # type: ignore[assignment]
     intervals: dict[str, int] = None  # type: ignore[assignment]
     exit_expectations: dict[str, str] | None = None
@@ -102,7 +111,9 @@ class Point:
             "name": self.name, "vantage": self.vantage, "country": self.country,
             "city": self.city, "isp": self.isp, "pin_geo": self.pin_geo,
             "check_account": self.check_account, "load_account": self.load_account,
+            "tcp_account": self.tcp_account,
             "check_squad": self.check_squad, "load_squad": self.load_squad,
+            "tcp_squad": self.tcp_squad,
             "has_check_sub": bool(self.check_sub_url), "has_load_sub": bool(self.load_sub_url),
             "modes": self.modes, "intervals": self.intervals,
             "exit_expectations": self.exit_expectations,
@@ -115,6 +126,14 @@ def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # The tcp set arrived after the first deployments: databases created by
+    # older versions lack its columns. CREATE IF NOT EXISTS does not extend
+    # an existing table, so add them here.
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(points)")}
+    for col in ("tcp_account", "tcp_squad", "tcp_sub_url"):
+        if col not in have:
+            conn.execute(f"ALTER TABLE points ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    conn.commit()
     return conn
 
 
@@ -140,8 +159,11 @@ def _row_to_point(r: sqlite3.Row) -> Point:
         country=r["country"], city=r["city"], isp=r["isp"], ip=r["ip"],
         pin_geo=bool(r["pin_geo"]),
         check_account=r["check_account"], load_account=r["load_account"],
+        tcp_account=r["tcp_account"],
         check_squad=r["check_squad"], load_squad=r["load_squad"],
+        tcp_squad=r["tcp_squad"],
         check_sub_url=r["check_sub_url"], load_sub_url=r["load_sub_url"],
+        tcp_sub_url=r["tcp_sub_url"],
         modes=json.loads(r["modes"] or "{}"), intervals=json.loads(r["intervals"] or "{}"),
         exit_expectations=json.loads(r["exit_expectations"]) if r["exit_expectations"] else None,
         push_enabled=bool(r["push_enabled"]), enabled=bool(r["enabled"]),
@@ -172,14 +194,15 @@ def create_point(conn: sqlite3.Connection, point: Point, secret: str) -> None:
     conn.execute(
         """INSERT INTO points
            (name, secret_hash, node_id, vantage, country, city, isp, ip, pin_geo,
-            check_account, load_account, check_squad, load_squad, check_sub_url,
-            load_sub_url, modes, intervals, exit_expectations, push_enabled, enabled,
-            version, note, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            check_account, load_account, tcp_account, check_squad, load_squad,
+            tcp_squad, check_sub_url, load_sub_url, tcp_sub_url, modes, intervals,
+            exit_expectations, push_enabled, enabled, version, note, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (point.name, hash_secret(secret), point.node_id or None, point.vantage,
          point.country, point.city, point.isp, point.ip, int(point.pin_geo),
-         point.check_account, point.load_account, point.check_squad,
-         point.load_squad, point.check_sub_url, point.load_sub_url,
+         point.check_account, point.load_account, point.tcp_account,
+         point.check_squad, point.load_squad, point.tcp_squad,
+         point.check_sub_url, point.load_sub_url, point.tcp_sub_url,
          json.dumps(point.modes), json.dumps(point.intervals),
          json.dumps(point.exit_expectations) if point.exit_expectations else "",
          int(point.push_enabled), int(point.enabled), 1, point.note, time.time()),
@@ -191,8 +214,9 @@ def create_point(conn: sqlite3.Connection, point: Point, secret: str) -> None:
 # how the probe learns about the edit and restarts, instead of diffing content.
 EDITABLE = {
     "vantage", "country", "city", "isp", "pin_geo", "check_squad", "load_squad",
-    "check_sub_url", "load_sub_url", "modes", "intervals", "exit_expectations",
-    "push_enabled", "enabled", "note", "check_account", "load_account",
+    "tcp_squad", "check_sub_url", "load_sub_url", "tcp_sub_url", "modes",
+    "intervals", "exit_expectations", "push_enabled", "enabled", "note",
+    "check_account", "load_account", "tcp_account",
 }
 _JSON_FIELDS = {"modes", "intervals", "exit_expectations"}
 

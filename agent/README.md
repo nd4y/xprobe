@@ -26,9 +26,14 @@ intervals, timeouts and port ranges:
 
 | Mode | What it does | Interval | Target set |
 |---|---|---|---|
-| `tcp` | TCP connect and TLS handshake to the inbound, no Xray | frequent (120 s) | same as `status` |
-| `status` | HTTP request through the config | medium (900 s) | the point's full set |
-| `download` | downloads a file, measures volume and speed | rare (1800 s) | a couple of configs |
+| `tcp` | TCP connect and TLS handshake to the inbound, no Xray | 300 s | its own |
+| `status` (shown as **http** in the UI) | HTTP request through the config | 300 s | its own |
+| `download` | downloads a file, measures volume and speed | 1800 s | its own — keep it short |
+
+`tcp` and `status` share a schedule and run concurrently, so a failing stage
+is always compared against a same-age result from the stage below it. Each
+mode has an independent target set: the cheap checks can cover everything
+while the bandwidth check stays on a couple of configs.
 
 The three modes answer different questions, and together they show **at which
 stage** things broke:
@@ -43,6 +48,10 @@ Separate subscriptions exist because the sets differ: the bandwidth check
 downloads through **every** config it has, and keeping its set short is
 essential. `download` success is the volume that arrived, not the status code:
 a throttled channel returns 200 and cuts off within the first kilobytes.
+
+The `status` mode keeps its wire name in the document, the metric label and
+the environment variables — dashboards depend on it. Only the UI calls it
+`http`, which is what it actually does.
 
 ## Metrics
 

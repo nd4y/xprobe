@@ -167,3 +167,39 @@ dialog h2 { font-size: 20px; margin-bottom: 14px; }
   position: fixed; bottom: 84px; left: 50%; transform: translateX(-50%); z-index: 9;
   background: var(--ink); color: var(--surface); padding: 11px 20px; border-radius: 999px; font-size: 14px;
 }
+
+/* command blocks in dialogs */
+.cmd { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
+.cmd .secret { margin: 4px 0 0; max-height: 260px; overflow: auto; }
+button.small { padding: 6px 14px; font-size: 13px; }
+
+/* ── motion ──
+   Standard M3 easing; entrances only — exits are instant, the user has
+   already decided to leave. */
+@keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes pop { from { opacity: 0; transform: scale(.96) translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+
+.view-enter > * { animation: rise .28s cubic-bezier(.2, 0, 0, 1) both; }
+.view-enter .stack > * { animation: rise .32s cubic-bezier(.2, 0, 0, 1) both; }
+.view-enter .stack > *:nth-child(2) { animation-delay: .04s; }
+.view-enter .stack > *:nth-child(3) { animation-delay: .08s; }
+.view-enter .stack > *:nth-child(4) { animation-delay: .12s; }
+.view-enter .points > *:nth-child(2) { animation-delay: .04s; }
+.view-enter .points > *:nth-child(3) { animation-delay: .08s; }
+.view-enter .points > *:nth-child(4) { animation-delay: .12s; }
+.view-enter .points > *:nth-child(n+5) { animation-delay: .16s; }
+
+.point-card:active { transform: scale(.99); }
+.point-card { transition: background .15s ease, border-color .15s ease, transform .1s ease; }
+button { transition: filter .1s ease, transform .1s ease; }
+button:active:not(:disabled) { transform: scale(.97); }
+tbody tr { transition: background .12s ease; }
+
+dialog[open] { animation: pop .22s cubic-bezier(.2, 0, 0, 1); }
+dialog[open]::backdrop { animation: fade .22s ease; }
+.toast.show { animation: rise .25s cubic-bezier(.2, 0, 0, 1); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

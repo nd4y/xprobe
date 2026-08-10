@@ -26,21 +26,29 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
         "tcp": d.tcp_interval, "status": d.status_interval, "download": d.download_interval,
     }
 
-    # Subscriptions: check feeds tcp and status, load feeds download. The keys
-    # in the document are exactly the ones the modes reference.
+    # Subscriptions: each check has its own target set. The `check` key is the
+    # http set's historical name and is kept as the tcp fallback — points
+    # provisioned before the tcp set existed have no tcp subscription yet.
     subscriptions: dict[str, str] = {}
     if point.check_sub_url:
         subscriptions["check"] = point.check_sub_url
     if point.load_sub_url:
         subscriptions["load"] = point.load_sub_url
+    if point.tcp_sub_url:
+        subscriptions["tcp"] = point.tcp_sub_url
 
+    sub_key = {
+        "tcp": "tcp" if point.tcp_sub_url else "check",
+        "status": "check",
+        "download": "load",
+    }
     probes: dict[str, Any] = {}
     for kind in MODES:
         enabled = bool(point.modes.get(kind, False))
         spec: dict[str, Any] = {
             "enabled": enabled,
             "interval": int(point.intervals.get(kind) or interval_default[kind]),
-            "subscription": "load" if kind == "download" else "check",
+            "subscription": sub_key[kind],
         }
         if kind == "status":
             spec["start_port"] = 20000

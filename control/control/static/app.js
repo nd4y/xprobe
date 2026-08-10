@@ -7,12 +7,15 @@
 // into a modal produced scroll-in-scroll.
 
 const MODES = ['tcp', 'status', 'download'];
+// The wire format and the metric label keep `status` (dashboards depend on
+// it); the UI calls the check `http` — that is what it actually does.
+const MODE_LABEL = { tcp: 'tcp', status: 'http', download: 'download' };
 const MODE_HINT = {
   tcp: 'connect + TLS handshake to the inbound',
   status: 'HTTP request through the config',
   download: 'file download, measures bandwidth',
 };
-const DEF_INT = { tcp: 120, status: 900, download: 1800 };
+const DEF_INT = { tcp: 300, status: 300, download: 1800 };
 
 function el(tag, attrs = {}, kids = []) {
   const n = document.createElement(tag);
@@ -40,6 +43,9 @@ async function api(path, opts = {}) {
 function toast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.hidden = false;
+  t.classList.remove('show');
+  void t.offsetWidth;                 // restart the animation
+  t.classList.add('show');
   clearTimeout(t._timer);
   t._timer = setTimeout(() => { t.hidden = true; }, 2600);
 }
@@ -82,6 +88,15 @@ function mswitch(checked, attrs = {}) {
   return wrap;
 }
 
+function render(...nodes) {
+  const box = document.getElementById('main');
+  box.replaceChildren(...nodes);
+  // A tiny entrance for every view change; CSS handles motion preferences.
+  box.classList.remove('view-enter');
+  void box.offsetWidth;
+  box.classList.add('view-enter');
+}
+
 // ── routing ──────────────────────────────────────────────────────────────────
 
 async function route() {
@@ -90,8 +105,7 @@ async function route() {
     if (m) await pointView(decodeURIComponent(m[1]));
     else await listView();
   } catch (e) {
-    document.getElementById('main').replaceChildren(
-      el('div', { class: 'signin' }, String(e.message)));
+    render(el('div', { class: 'signin' }, String(e.message)));
   }
 }
 window.addEventListener('hashchange', route);
@@ -99,10 +113,9 @@ window.addEventListener('hashchange', route);
 async function main() {
   const me = await api('/me').catch(() => ({ authenticated: false }));
   const who = document.getElementById('who');
-  const box = document.getElementById('main');
   if (!me.authenticated || !me.owner) {
     who.replaceChildren();
-    box.replaceChildren(el('div', { class: 'signin' }, [
+    render(el('div', { class: 'signin' }, [
       el('p', {}, me.authenticated ? 'Administrator rights required.' : 'Sign-in required.'),
       el('button', { class: 'filled', onclick: () => { location.href = '/auth/login'; } }, 'Sign in'),
     ]));
@@ -115,8 +128,7 @@ async function main() {
 // ── list view ────────────────────────────────────────────────────────────────
 
 async function listView() {
-  const box = document.getElementById('main');
-  box.replaceChildren(el('div', { class: 'loader' }, 'loading…'));
+  render(el('div', { class: 'loader' }, 'loading…'));
   const points = await api('/admin/points');
 
   const toolbar = el('div', { class: 'toolbar' }, [
@@ -141,20 +153,19 @@ async function listView() {
         chip(`v${p.version}`),
         chip(p.vantage, 'tonal'),
         p.auto ? chip('auto-enrolled') : null,
-        ...modes.map((m) => chip(`${m} / ${(p.intervals && p.intervals[m]) || DEF_INT[m]}s`)),
+        ...modes.map((m) => chip(`${MODE_LABEL[m]} / ${(p.intervals && p.intervals[m]) || DEF_INT[m]}s`)),
       ]),
     ]);
   });
 
-  box.replaceChildren(toolbar, el('div', { class: 'points' },
+  render(toolbar, el('div', { class: 'points' },
     cards.length ? cards : [el('div', { class: 'muted' }, 'No points yet — add one or share the enroll token.')]));
 }
 
 // ── point view ───────────────────────────────────────────────────────────────
 
 async function pointView(name) {
-  const box = document.getElementById('main');
-  box.replaceChildren(el('div', { class: 'loader' }, 'loading…'));
+  render(el('div', { class: 'loader' }, 'loading…'));
   const [p, hosts] = await Promise.all([
     api(`/admin/points/${encodeURIComponent(name)}`),
     api('/admin/panel/hosts'),
@@ -199,7 +210,7 @@ async function pointView(name) {
   const checksCard = el('div', { class: 'card' }, [
     el('div', { class: 'section-title' }, [
       el('h3', {}, 'Checks'),
-      el('div', { class: 'muted' }, 'Each check runs on its own schedule.'),
+      el('div', { class: 'muted' }, 'Each check runs on its own schedule; tcp and http run concurrently.'),
     ]),
     ...MODES.map((m) => {
       const sw = mswitch(!!p.modes[m]);
@@ -208,7 +219,7 @@ async function pointView(name) {
       modeBoxes[m] = sw.input; intBoxes[m] = iv;
       return el('div', { class: 'check-row' }, [
         sw,
-        el('span', { class: 'name' }, m),
+        el('span', { class: 'name' }, MODE_LABEL[m]),
         el('span', { class: 'muted grow' }, MODE_HINT[m]),
         el('span', { class: 'every' }, [el('span', { class: 'muted' }, 'every'), iv,
           el('span', { class: 'muted' }, 's')]),
@@ -216,13 +227,23 @@ async function pointView(name) {
     }),
   ]);
 
-  // — targets: one table, two checkbox columns —
-  const checkSel = new Set(p.check_remarks || []);
-  const loadSel = new Set(p.load_remarks || []);
+  // — targets: one table, a checkbox column per check —
+  const sels = {
+    tcp: new Set(p.tcp_remarks || []),
+    status: new Set(p.check_remarks || []),
+    download: new Set(p.load_remarks || []),
+  };
   const search = el('input', { type: 'search', placeholder: 'Filter hosts…' });
   const tbody = el('tbody');
-  const allCheck = el('input', { type: 'checkbox', title: 'toggle all visible' });
-  const allLoad = el('input', { type: 'checkbox', title: 'toggle all visible' });
+  const allBoxes = {};
+  for (const m of MODES) {
+    allBoxes[m] = el('input', { type: 'checkbox', title: 'toggle all visible',
+      onchange: () => {
+        visibleHosts().forEach((h) =>
+          allBoxes[m].checked ? sels[m].add(h.remark) : sels[m].delete(h.remark));
+        renderRows();
+      } });
+  }
 
   function visibleHosts() {
     const q = search.value.trim().toLowerCase();
@@ -231,32 +252,23 @@ async function pointView(name) {
   }
   function renderRows() {
     const vis = visibleHosts();
-    tbody.replaceChildren(...vis.map((h) => {
-      const cb = el('input', { type: 'checkbox', checked: checkSel.has(h.remark),
-        onchange: (e) => { e.target.checked ? checkSel.add(h.remark) : checkSel.delete(h.remark); syncAll(); } });
-      const lb = el('input', { type: 'checkbox', checked: loadSel.has(h.remark),
-        onchange: (e) => { e.target.checked ? loadSel.add(h.remark) : loadSel.delete(h.remark); syncAll(); } });
-      return el('tr', {}, [
-        el('td', {}, [h.remark, el('span', { class: 'in' }, h.inbound)]),
-        el('td', { class: 'c' }, cb),
-        el('td', { class: 'c' }, lb),
-      ]);
-    }));
+    tbody.replaceChildren(...vis.map((h) => el('tr', {}, [
+      el('td', {}, [h.remark, el('span', { class: 'in' }, h.inbound)]),
+      ...MODES.map((m) => el('td', { class: 'c' },
+        el('input', { type: 'checkbox', checked: sels[m].has(h.remark),
+          onchange: (e) => {
+            e.target.checked ? sels[m].add(h.remark) : sels[m].delete(h.remark);
+            syncAll();
+          } }))),
+    ])));
     syncAll();
   }
   function syncAll() {
     const vis = visibleHosts();
-    allCheck.checked = vis.length > 0 && vis.every((h) => checkSel.has(h.remark));
-    allLoad.checked = vis.length > 0 && vis.every((h) => loadSel.has(h.remark));
+    for (const m of MODES) {
+      allBoxes[m].checked = vis.length > 0 && vis.every((h) => sels[m].has(h.remark));
+    }
   }
-  allCheck.onchange = () => {
-    visibleHosts().forEach((h) => allCheck.checked ? checkSel.add(h.remark) : checkSel.delete(h.remark));
-    renderRows();
-  };
-  allLoad.onchange = () => {
-    visibleHosts().forEach((h) => allLoad.checked ? loadSel.add(h.remark) : loadSel.delete(h.remark));
-    renderRows();
-  };
   search.oninput = renderRows;
   renderRows();
 
@@ -264,31 +276,35 @@ async function pointView(name) {
     el('div', { class: 'section-title' }, [
       el('h3', {}, 'Targets'),
       el('div', { class: 'muted' },
-        'Frequent = tcp + status (cheap, the full set). Bandwidth = download (heavy — keep this set short).'),
+        'Each check has its own target set. tcp and http are cheap — the full set is fine; download is heavy, keep its set short.'),
     ]),
     el('div', { class: 'targets-tools' }, [search]),
     el('div', { class: 'targets' }, el('div', { class: 'scroll' },
       el('table', {}, [
         el('thead', {}, el('tr', {}, [
           el('th', {}, 'Host'),
-          el('th', { class: 'c' }, ['Frequent ', allCheck]),
-          el('th', { class: 'c' }, ['Bandwidth ', allLoad]),
+          ...MODES.map((m) => el('th', { class: 'c' }, [`${MODE_LABEL[m]} `, allBoxes[m]])),
         ])),
         tbody,
       ]))),
   ]);
 
-  // — maintenance —
+  // — deployment & maintenance —
   const maintCard = el('div', { class: 'card' }, [
     el('div', { class: 'section-title' }, [
-      el('h3', {}, 'Maintenance'),
-      el('div', { class: 'muted' }, 'Rotating the secret restarts the probe; removal only forgets the point here — panel accounts and squads remain.'),
+      el('h3', {}, 'Deployment'),
+      el('div', { class: 'muted' },
+        'Only a hash of the secret is stored, so a run command comes with a fresh secret — the running probe must be restarted with it.'),
     ]),
     el('div', { class: 'row' }, [
-      el('button', { class: 'outlined', onclick: async () => {
-        const r = await api(`/admin/points/${encodeURIComponent(name)}/rotate-secret`, { method: 'POST' });
-        showSecret('New secret', r.secret);
-      } }, 'Rotate secret'),
+      el('button', { class: 'tonal', onclick: () =>
+        confirmDialog('Issue a run command?',
+          'This rotates the point’s secret: the currently running probe keeps working until its next config poll, then needs the new command.',
+          'Issue', async () => {
+            const r = await api(`/admin/points/${encodeURIComponent(name)}/rotate-secret`, { method: 'POST' });
+            showCommands('Run command', r.install);
+          }) }, 'Run command'),
+      el('span', { class: 'grow' }),
       el('button', { class: 'outlined danger', onclick: () =>
         confirmDialog(`Remove ${name}?`,
           'The point is removed from the control plane only. Panel accounts and squads stay in place.',
@@ -314,7 +330,8 @@ async function pointView(name) {
       });
       await api(`/admin/points/${encodeURIComponent(name)}/set`, {
         method: 'POST',
-        body: { check_remarks: [...checkSel], load_remarks: [...loadSel] },
+        body: { tcp_remarks: [...sels.tcp], check_remarks: [...sels.status],
+                load_remarks: [...sels.download] },
       });
       toast('Saved — the probe restarts with the new version');
       await pointView(name);
@@ -325,7 +342,7 @@ async function pointView(name) {
     save,
   ]));
 
-  box.replaceChildren(head, el('div', { class: 'stack' },
+  render(head, el('div', { class: 'stack' },
     [locationCard, checksCard, targetsCard, maintCard]), savebar);
 }
 
@@ -373,7 +390,7 @@ async function addPoint() {
           vantage: vantage.value, check_remarks: [], load_remarks: [],
         },
       });
-      showSecret('Point provisioned', r.secret, r.install,
+      showCommands('Point provisioned', r.install,
         () => { location.hash = `#/p/${encodeURIComponent(r.name)}`; });
     } catch (err) { toast(String(err.message)); e.target.disabled = false; }
   } }, 'Provision');
@@ -388,24 +405,28 @@ async function addPoint() {
   ], [create]);
 }
 
-function showSecret(title, secret, install, onClose) {
+function cmdBlock(label, text) {
+  return el('div', { class: 'cmd' }, [
+    el('div', { class: 'row' }, [
+      el('span', { class: 'muted grow' }, label),
+      el('button', { class: 'small', onclick: () => {
+        navigator.clipboard.writeText(text).then(() => toast('Copied'));
+      } }, 'Copy'),
+    ]),
+    el('div', { class: 'secret' }, text),
+  ]);
+}
+
+function showCommands(title, install, onClose) {
   const d = document.getElementById('dialog');
-  const body = [
-    el('p', { class: 'muted' }, 'The secret is shown only once — save it.'),
-    el('div', { class: 'secret' }, secret),
-  ];
-  if (install) {
-    body.push(el('p', { class: 'muted' }, 'Install command for the point operator:'));
-    body.push(el('div', { class: 'secret' }, install));
-  }
-  const copy = el('button', { class: 'filled', onclick: () => {
-    navigator.clipboard.writeText(install || secret).then(() => toast('Copied'));
-  } }, 'Copy');
-  dialog(title, body, [copy]);
+  dialog(title, [
+    el('p', { class: 'muted' }, 'The command embeds the fresh secret and is shown only once. Pick the flavor that matches the node:'),
+    cmdBlock('docker', install.docker),
+    cmdBlock('kubectl', install.kubectl),
+  ], []);
   if (onClose) d.addEventListener('close', onClose, { once: true });
 }
 
 main().catch((e) => {
-  document.getElementById('main').replaceChildren(
-    el('div', { class: 'signin' }, String(e.message)));
+  render(el('div', { class: 'signin' }, String(e.message)));
 });
