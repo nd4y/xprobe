@@ -245,6 +245,25 @@ def test_configs_endpoint_returns_only_the_check_s_targets(tmp_path):
     assert got["download"] == ["RU · XHTTP"]
 
 
+def test_a_target_the_account_cannot_see_is_reported(tmp_path):
+    # Filtering against a subscription that lacks the host yields fewer
+    # configs than asked for. Silently, the check would look healthy while
+    # probing less — so the control plane records it and the UI shows it.
+    panel = FakePanel()
+    points, admin, deps = build(tmp_path, panel=panel)
+    admin.post("/api/admin/points", cookies=owner_cookie(),
+               json={"name": "yar", "check_remarks": ["RU · TLS"], "load_remarks": []})
+    db.rotate_secret(deps.conn, "yar", "sec")
+    # A host that exists in the panel but not in this account's subscription.
+    panel.hosts_ = [h for h in panel.hosts_ if h.remark != "RU · TLS"]
+
+    r = points.get("/api/points/yar/configs/status", headers=basic("yar", "sec"))
+    assert r.status_code == 200
+    assert r.json() == []
+    detail = admin.get("/api/admin/points/yar", cookies=owner_cookie()).json()
+    assert detail["missing_targets"] == ["RU · TLS"]
+
+
 def test_configs_are_not_served_to_a_foreign_secret(tmp_path):
     points, _, deps = build(tmp_path)
     db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c"), "sec")
