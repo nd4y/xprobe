@@ -1,36 +1,27 @@
-from control.panel import Host, plan_squad_membership
+"""The panel client's boundaries.
 
-# Three hosts, two sharing one inbound (like RU-XHTTP in a real panel: the
-# same inbound serves both the direct entry and the CDN entry).
-HOSTS = [
-    Host(uuid="h1", remark="RU · TLS", inbound_uuid="i-tls"),
-    Host(uuid="h2", remark="RU · XHTTP", inbound_uuid="i-xhttp"),
-    Host(uuid="h3", remark="RU ← CF · XHTTP", inbound_uuid="i-xhttp"),
-]
+Target sets used to be applied by editing squad membership and patching live
+host objects. That is gone: the control plane filters configs instead, so the
+client must not be able to modify a host at all — `PATCH /api/hosts` silently
+resets every field absent from the body, and no monitoring feature is worth
+that risk.
+"""
 
-
-def test_squad_inbounds_are_the_union_of_selected():
-    inbounds, _ = plan_squad_membership("sq", HOSTS, {"RU · TLS", "RU · XHTTP"})
-    assert set(inbounds) == {"i-tls", "i-xhttp"}
+from control.panel import Host, Panel
 
 
-def test_inbound_neighbor_is_hidden_by_exclusion():
-    # Only one of the two hosts on the shared inbound is selected — the other
-    # must be excluded, or it would show up in the squad along for the ride.
-    _, changed = plan_squad_membership("sq", HOSTS, {"RU · XHTTP"})
-    assert changed == {"h3": ["sq"]}
+def test_the_client_cannot_modify_hosts_or_squad_membership():
+    for forbidden in ("patch_host", "set_squad_inbounds", "delete_host"):
+        assert not hasattr(Panel, forbidden), f"{forbidden} must stay removed"
 
 
-def test_stale_exclusion_is_removed():
-    hosts = [Host(uuid="h2", remark="RU · XHTTP", inbound_uuid="i-xhttp", excluded=["sq"])]
-    _, changed = plan_squad_membership("sq", hosts, {"RU · XHTTP"})
-    assert changed == {"h2": []}
+def test_the_client_still_provisions_accounts():
+    for needed in ("create_squad", "create_user", "hosts", "squads", "subscription"):
+        assert hasattr(Panel, needed)
 
 
-def test_matching_set_changes_nothing():
-    hosts = [
-        Host(uuid="h2", remark="RU · XHTTP", inbound_uuid="i-xhttp"),
-        Host(uuid="h3", remark="RU ← CF · XHTTP", inbound_uuid="i-xhttp", excluded=["sq"]),
-    ]
-    _, changed = plan_squad_membership("sq", hosts, {"RU · XHTTP"})
-    assert changed == {}
+def test_host_exclusions_are_still_readable_for_migration():
+    # A point whose sets predate the switch has them in squad membership, so
+    # the exclusion list must remain visible — read-only.
+    h = Host(uuid="h1", remark="RU · TLS", inbound_uuid="i-tls", excluded=["sq"])
+    assert h.excluded == ["sq"]

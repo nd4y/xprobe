@@ -3,15 +3,15 @@
 import prober
 import pytest
 
+BASE = "https://xprobe.example/api/points/yaroslavl/configs"
 DOC = {
     "version": 5,
     "point": "yaroslavl",
     "labels": {"point": "yaroslavl", "vantage": "home", "country": "RU"},
-    "subscriptions": {"check": "https://sub/check", "load": "https://sub/load"},
     "probes": {
-        "tcp": {"enabled": True, "interval": 120, "subscription": "check"},
-        "status": {"enabled": True, "interval": 900, "subscription": "check"},
-        "download": {"enabled": False, "interval": 1800, "subscription": "load"},
+        "tcp": {"enabled": True, "interval": 120, "configs_url": f"{BASE}/tcp"},
+        "status": {"enabled": True, "interval": 900, "configs_url": f"{BASE}/status"},
+        "download": {"enabled": False, "interval": 1800, "configs_url": f"{BASE}/download"},
     },
     "exit_expectations": {"WARP": "104.28.,172.6"},
     "push": {"url": "https://vmauth/api/v1/import/prometheus", "interval": 60},
@@ -25,10 +25,12 @@ def test_enabled_modes_become_probes():
     assert cfg.version == 5
 
 
-def test_each_mode_reads_its_own_subscription():
+def test_each_mode_reads_its_own_config_endpoint():
     cfg = prober.Config.from_document(DOC, point="yaroslavl", push_password="tok")
     status = next(p for p in cfg.probes if p.kind == "status")
-    assert status.subscription_url == "https://sub/check"
+    assert status.subscription_url == f"{BASE}/status"
+    # And carries the point's credentials — the endpoint is authenticated.
+    assert status.auth == ("yaroslavl", "tok")
 
 
 def test_push_credentials_are_point_name_and_secret():
@@ -46,9 +48,8 @@ def test_exit_expectations_parse_into_regexes():
     assert prefixes == ("104.28.", "172.6")
 
 
-def test_enabled_mode_without_subscription_is_an_error():
-    bad = dict(DOC, subscriptions={"check": "https://sub/check"},
-               probes={"download": {"enabled": True, "subscription": "load"}})
+def test_enabled_mode_without_a_config_source_is_an_error():
+    bad = dict(DOC, probes={"download": {"enabled": True}})
     with pytest.raises(ValueError, match="download"):
         prober.Config.from_document(bad, point="p", push_password="t")
 
@@ -66,7 +67,7 @@ def test_timing_camouflage_reaches_the_probes():
 
 def test_volume_settings_are_read_from_the_document():
     doc = dict(DOC, probes=dict(DOC["probes"],
-                                download={"enabled": True, "subscription": "load",
+                                download={"enabled": True, "configs_url": f"{BASE}/download",
                                           "url": "https://host/10Mb.dat",
                                           "min_bytes": 10 * 1024**2}))
     cfg = prober.Config.from_document(doc, point="p", push_password="t")

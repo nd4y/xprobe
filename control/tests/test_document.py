@@ -1,3 +1,5 @@
+import json
+
 from control.config import Defaults
 from control.db import Point
 from control.document import build_document
@@ -5,11 +7,13 @@ from control.document import build_document
 DEF = Defaults()
 
 
+SITE = "https://xprobe.example"
+
+
 def point(**kw) -> Point:
     base = dict(
         name="yaroslavl", vantage="home", country="RU", city="Yaroslavl",
-        check_sub_url="https://sub/check", load_sub_url="https://sub/load",
-        version=7,
+        check_sub_url="https://sub/check", version=7,
     )
     base.update(kw)
     return Point(**base)
@@ -21,7 +25,14 @@ def test_labels_without_pin_are_name_and_role_only():
     doc = build_document(point(), DEF)
     assert doc["version"] == 7
     assert doc["labels"] == {"point": "yaroslavl", "vantage": "home"}
-    assert doc["subscriptions"] == {"check": "https://sub/check", "load": "https://sub/load"}
+
+
+def test_document_carries_no_subscription_links():
+    # The probe reads configs from the control plane, so a subscription link
+    # — which is a credential — never reaches the node.
+    doc = build_document(point(), DEF, base_url=SITE)
+    assert "subscriptions" not in doc
+    assert "sub" not in json.dumps(doc).replace("subscription_interval", "")
 
 
 def test_pinned_geo_goes_into_the_document():
@@ -42,20 +53,11 @@ def test_disabled_mode_is_served_disabled():
     assert doc["probes"]["tcp"]["enabled"] is True
 
 
-def test_each_check_reads_its_own_subscription():
-    doc = build_document(point(tcp_sub_url="https://sub/tcp"), DEF)
-    assert doc["probes"]["download"]["subscription"] == "load"
-    assert doc["probes"]["status"]["subscription"] == "check"
-    assert doc["probes"]["tcp"]["subscription"] == "tcp"
-    assert doc["subscriptions"]["tcp"] == "https://sub/tcp"
-
-
-def test_tcp_falls_back_to_the_http_subscription_when_unset():
-    # A point provisioned before the tcp set existed has no tcp subscription;
-    # tcp then reads the http (check) set rather than nothing.
-    doc = build_document(point(), DEF)
-    assert "tcp" not in doc["subscriptions"]
-    assert doc["probes"]["tcp"]["subscription"] == "check"
+def test_each_check_points_at_its_own_config_endpoint():
+    doc = build_document(point(), DEF, base_url=SITE)
+    for kind in ("tcp", "status", "download"):
+        assert doc["probes"][kind]["configs_url"] == \
+            f"{SITE}/api/points/yaroslavl/configs/{kind}"
 
 
 def test_interval_override_lands_in_the_document():

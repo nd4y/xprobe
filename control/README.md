@@ -8,16 +8,33 @@ where the metrics go**.
 ## How it works
 
 ```
-        ┌─ fetches its document (basic auth: point name + secret)
-probe ──┤
-   ▲    └─ pushes metrics itself to push.url (same secret)
+        ┌─ fetches its document      (basic auth: point name + secret)
+probe ──┼─ fetches its configs       (already filtered to its target set)
+   ▲    └─ pushes metrics to the relay (same secret)
    │
    │  document version changed → probe exits → the restart applies the change
    ▼
-xprobe-control ──reads/writes──> Remnawave panel (squads, hosts, accounts)
+xprobe-control ──reads──> Remnawave panel (one squad, one account per point)
    │
    └─ administrator UI: point list, target sets as checkboxes, "+ Add point"
 ```
+
+## The panel holds identities, the control plane holds policy
+
+One squad — `Monitor`, containing every inbound — and one account per point.
+Nothing else. What a point actually probes is decided here, when the control
+plane filters that point's subscription down to the target set of the check
+asking for it.
+
+That split is deliberate. Target edits used to rewrite squad membership and
+patch live host objects, which is where the sharp edges were: `PATCH
+/api/hosts` silently drops every field absent from the body, and hosts sharing
+an inbound had to be hidden from each other with exclusion lists. None of that
+exists now — the panel client has no method that can modify a host.
+
+An account per point rather than one for the fleet: probes run on machines
+other people control, so a point must be revocable on its own. Disable its
+account and that point stops, and only that point.
 
 ## Two ports: public and administrative
 
@@ -84,13 +101,9 @@ plane, metrics go through the relay.
 
 The "+ Add point" button in the UI, in one step:
 
-1. creates three panel squads `Monitor-<point>-tcp` / `-check` / `-load`, one
-   per check, and fills them with the selected hosts (via
-   `excludedInternalSquads`, as everywhere);
-2. creates three monitoring accounts `monitor_<point>_tcp` / `monitor_<point>`
-   / `_load` tagged `MONITOR`;
-3. saves their subscription links into its own DB (the hot path makes no panel
-   calls);
+1. creates the shared `Monitor` squad if it does not exist yet;
+2. creates the point's account `monitor_<point>` in it, tagged `MONITOR`;
+3. saves its subscription link and its per-check target sets in its own DB;
 4. generates the point's secret and shows **ready run commands** — `docker
    run` and `kubectl apply` — to hand to the point operator.
 

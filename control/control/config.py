@@ -108,6 +108,10 @@ class Config:
     # no SSO plumbing is needed.
     admin_user: str = ""
     admin_password: str = ""
+    # The one panel squad every monitoring account belongs to. It holds every
+    # inbound; what a point actually probes is decided here, when configs are
+    # filtered — so the panel needs no per-point structure.
+    shared_squad_name: str = "Monitor"
     # Default target set for auto-enrolled nodes: panel host remarks, comma
     # separated. Every point gets its OWN pair of squads and accounts — a
     # shared subscription would tie the inbound sets of unrelated points
@@ -149,6 +153,7 @@ class Config:
             edge_secret=_env("XPC_EDGE_SECRET"),
             admin_user=admin_user,
             admin_password=admin_password,
+            shared_squad_name=_env("XPC_SHARED_SQUAD", default="Monitor"),
             default_check_remarks=_csv(_env("XPC_DEFAULT_CHECK_REMARKS")),
             default_load_remarks=_csv(_env("XPC_DEFAULT_LOAD_REMARKS")),
         )

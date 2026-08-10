@@ -85,10 +85,17 @@ edited centrally:
 | `CONTROL_TOKEN` | the point's secret: metrics are pushed with it too |
 | `CONTROL_INTERVAL` | how often to check the document version (60 s) |
 
+Configs come from the control plane too, already filtered to this point's
+target set, and are **held in memory only** — they carry working credentials
+for someone else's tunnels, and the probe runs on a machine its operator does
+not own. The core is fed through a pipe (`xray run -c stdin:`), so no config
+reaches that machine's disk even transiently.
+
 In this mode the probe **pushes metrics itself** to the document's `push.url`
 (no scraper needed); on delivery failure it spools to disk (`SPOOL_PATH`) and
-resends. The last good document is cached (`CONFIG_CACHE`): a control-plane
-outage does not disturb an already running point. A document version change =
+resends. The last good document is cached (`CONFIG_CACHE`) — settings only, no
+credentials — so a control-plane outage does not disturb an already running
+point. A document version change =
 a clean process exit; the restart rebuilds the configuration.
 
 **From the environment** — the legacy mode (for locally scraped deployments

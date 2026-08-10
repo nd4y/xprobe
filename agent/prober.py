@@ -30,6 +30,12 @@ Two models, chosen by the presence of CONTROL_URL:
   control plane outage only blinds a NEW point; a running one survives it
   silently.
 
+  Configs themselves come from the control plane too, already filtered to this
+  point's target set, and are held **in memory only**. They carry working
+  credentials for someone else's tunnels, and the probe runs on machines its
+  operator does not own — so nothing config-shaped is ever written to that
+  machine's disk, not even transiently: the core is fed through a pipe.
+
 * **environment** (CONTROL_URL empty) — the legacy mode: subscriptions,
   intervals and labels come from variables, metrics are exposed on /metrics
   for an external scraper. Kept for locally-scraped deployments and tests.
@@ -51,7 +57,6 @@ import socket
 import ssl
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -83,9 +88,13 @@ def env_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Probe:
-    """One mode: its own subscription, interval and port range."""
+    """One mode: its own config source, interval and port range."""
 
     kind: str                      # tcp | status | download
+    # Where this check's configs come from. In control-plane mode this is the
+    # centre's per-check endpoint, which returns configs already filtered to
+    # this point's target set; in the legacy environment mode it is a panel
+    # subscription URL.
     subscription_url: str
     interval: int
     start_port: int
@@ -99,6 +108,8 @@ class Probe:
     # trivially distinguishable from a person using the same tunnels.
     jitter: float = 0.2
     spread: float = 0.5
+    # Credentials for the centre's config endpoint (point name + secret).
+    auth: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -203,31 +214,30 @@ class Config:
         malformed document must not take down an already running point —
         validity is the caller's concern, this only parses known fields.
         """
-        subs = doc.get("subscriptions") or {}
         defaults = {
-            "tcp": {"interval": 300, "timeout": 10, "start_port": 0, "subscription": "check"},
+            "tcp": {"interval": 300, "timeout": 10, "start_port": 0},
             "status": {"interval": 300, "timeout": 30, "start_port": 20000,
-                       "subscription": "check", "url": "http://cp.cloudflare.com/generate_204"},
+                       "url": "http://cp.cloudflare.com/generate_204"},
             "download": {"interval": 1800, "timeout": 60, "start_port": 20500,
-                         "subscription": "load", "min_bytes": 524288,
+                         "min_bytes": 524288,
                          "url": "https://proof.ovh.net/files/1Mb.dat"},
         }
         sub_interval = int(doc.get("subscription_interval") or 300)
+        auth = (point, push_password) if point else None
         probes: list[Probe] = []
         for kind in ("tcp", "status", "download"):
             spec = (doc.get("probes") or {}).get(kind) or {}
             if not spec.get("enabled", False):
                 continue
             d = defaults[kind]
-            sub_key = spec.get("subscription") or d["subscription"]
-            sub_url = subs.get(sub_key)
-            if not sub_url:
-                # A mode is enabled but has no subscription behind it — that is
-                # a document error, not a workable situation.
-                raise ValueError(f"mode {kind}: no subscription {sub_key!r}")
+            configs_url = str(spec.get("configs_url") or "")
+            if not configs_url:
+                # A mode is enabled but has nowhere to read configs from —
+                # that is a document error, not a workable situation.
+                raise ValueError(f"mode {kind}: no configs_url")
             probes.append(Probe(
                 kind=kind,
-                subscription_url=sub_url,
+                subscription_url=configs_url,
                 interval=int(spec.get("interval") or d["interval"]),
                 start_port=int(spec.get("start_port") or d["start_port"]),
                 timeout=int(spec.get("timeout") or d["timeout"]),
@@ -236,6 +246,7 @@ class Config:
                 subscription_interval=sub_interval,
                 jitter=float(spec.get("jitter", doc.get("jitter", 0.2))),
                 spread=float(spec.get("spread", doc.get("spread", 0.5))),
+                auth=auth,
             ))
         if not probes:
             raise ValueError("the document has no enabled modes")
@@ -372,12 +383,23 @@ def geo_loop(state: State, cfg: Config, report=None) -> None:
         time.sleep(3600 if geo else 600)
 
 
-def fetch_subscription(url: str, cfg: Config, timeout: int) -> list[dict]:
+def fetch_subscription(url: str, cfg: Config, timeout: int,
+                       auth: tuple[str, str] | None = None) -> list[dict]:
+    """The configs this check should probe.
+
+    In control-plane mode the URL is the centre's per-check endpoint and the
+    answer is already filtered to this point's target set. The configs are
+    returned to the caller and kept in memory only — they carry credentials
+    and have no business being written to the node's disk.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": cfg.user_agent})
+    if auth is not None:
+        token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = json.loads(r.read().decode("utf-8"))
     if not isinstance(body, list):
-        raise ValueError("subscription did not return a config list — xray-json format required")
+        raise ValueError("config source did not return a list — xray-json format required")
     return [c for c in body if c.get("outbounds")]
 
 
@@ -568,15 +590,19 @@ def probe_one(entry: dict, port: int, probe: Probe, cfg: Config) -> Result:
             res.exit_expected = prefixes
             break
 
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(client_config(entry, port), f)
-        path = f.name
-
+    # The config goes to the core through a pipe, never through a file. A
+    # config carries working credentials for someone else's tunnel, and the
+    # probe runs on machines the operator does not own; encrypting a temp file
+    # would be theatre, since the core has to be handed plaintext anyway.
+    # Nothing here touches the filesystem, so there is nothing to leak, to
+    # forget to delete, or to find in a backup.
     proc = subprocess.Popen(
-        [XRAY, "run", "-config", path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [XRAY, "run", "-c", "stdin:"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
+        with proc.stdin as sink:
+            sink.write(json.dumps(client_config(entry, port)).encode())
         if not wait_port(port, time.time() + 10):
             return res
         r = http_get(probe.url, port, probe.timeout, keep_body=False)
@@ -601,8 +627,6 @@ def probe_one(entry: dict, port: int, probe: Probe, cfg: Config) -> Result:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-        with contextlib.suppress(OSError):
-            os.unlink(path)
     return res
 
 
@@ -614,7 +638,8 @@ def run_probe(probe: Probe, state: State, cfg: Config, stop: threading.Event) ->
         started = time.time()
         if started - fetched_at >= probe.subscription_interval:
             try:
-                entries = fetch_subscription(probe.subscription_url, cfg, probe.timeout)
+                entries = fetch_subscription(probe.subscription_url, cfg, probe.timeout,
+                                             probe.auth)
                 fetched_at = started
                 with state.lock:
                     state.configs[probe.kind] = len(entries)
