@@ -1,5 +1,7 @@
 """Document parsing with the very code that runs on points (prober.Config)."""
 
+import json
+
 import prober
 import pytest
 
@@ -52,6 +54,33 @@ def test_enabled_mode_without_a_config_source_is_an_error():
     bad = dict(DOC, probes={"download": {"enabled": True}})
     with pytest.raises(ValueError, match="download"):
         prober.Config.from_document(bad, point="p", push_password="t")
+
+
+def test_a_disabled_document_builds_nothing(monkeypatch, tmp_path):
+    # The probe must stand down rather than keep its old configuration: this
+    # is what makes disabling a point in the UI actually stop the node.
+    monkeypatch.setattr(prober, "CACHE_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(prober, "fetch_document",
+                        lambda *a, **k: dict(DOC, enabled=False))
+    monkeypatch.setattr(prober, "resolve_identity", lambda url: ("yar", "sec"))
+    cfg, point, secret = prober.build_config("https://control")
+    assert cfg is None and point == "yar"
+
+
+def test_a_disabled_cache_does_not_resume_on_an_outage(monkeypatch, tmp_path):
+    # The control plane being unreachable must not look like permission to
+    # start probing again.
+    cache = tmp_path / "config.json"
+    cache.write_text(json.dumps(dict(DOC, enabled=False)), encoding="utf-8")
+    monkeypatch.setattr(prober, "CACHE_PATH", str(cache))
+    monkeypatch.setattr(prober, "resolve_identity", lambda url: ("yar", "sec"))
+
+    def boom(*a, **k):
+        raise OSError("control plane down")
+
+    monkeypatch.setattr(prober, "fetch_document", boom)
+    cfg, _, _ = prober.build_config("https://control")
+    assert cfg is None
 
 
 def test_node_id_prefers_the_environment(monkeypatch, tmp_path):

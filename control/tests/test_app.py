@@ -124,10 +124,24 @@ def test_foreign_secret_fetches_no_document(tmp_path):
     assert points.get("/api/points/yar/config", headers=basic("tlt", "sec")).status_code == 401
 
 
-def test_disabled_point_serves_no_config(tmp_path):
+def test_a_disabled_point_is_told_to_stand_down(tmp_path):
+    # Not refused: a probe treats an unreachable control plane as an outage
+    # and carries on with what it has, so the only way to make it stop is to
+    # answer and say so.
     points, _, deps = build(tmp_path)
     db.create_point(deps.conn, db.Point(name="yar", enabled=False), "sec")
-    assert points.get("/api/points/yar/config", headers=basic("yar", "sec")).status_code == 404
+    r = points.get("/api/points/yar/config", headers=basic("yar", "sec"))
+    assert r.status_code == 200
+    assert r.json()["enabled"] is False
+
+
+def test_a_disabled_point_cannot_push_metrics(tmp_path):
+    # Takes effect on the next sample rather than the next poll — a probe that
+    # has not yet asked is still pushing.
+    points, _, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", enabled=False), "sec")
+    r = points.post("/api/points/yar/metrics", headers=basic("yar", "sec"), content=b"x 1")
+    assert r.status_code == 403
 
 
 # ── port separation: no admin routes on the points app and vice versa ─────────

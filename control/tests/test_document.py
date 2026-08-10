@@ -90,6 +90,12 @@ def test_volume_test_settings_are_per_point():
     assert plain["probes"]["download"]["min_bytes"] == DEF.download_min_bytes
 
 
+def test_document_says_whether_the_point_is_enabled():
+    # This flag is what stops a probe: it cannot be inferred from silence.
+    assert build_document(point(), DEF)["enabled"] is True
+    assert build_document(point(enabled=False), DEF)["enabled"] is False
+
+
 def test_document_carries_timing_camouflage():
     doc = build_document(point(), DEF)
     assert doc["jitter"] == DEF.jitter and doc["spread"] == DEF.spread

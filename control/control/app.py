@@ -191,8 +191,12 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         if user != point or stored is None or not db.check_secret(pw, stored):
             return _basic_challenge()
         p = db.get_point(deps.conn, point)
-        if p is None or not p.enabled:
-            raise HTTPException(404, "point is disabled or does not exist")
+        if p is None:
+            raise HTTPException(404, "point does not exist")
+        # A disabled point still gets its document, carrying enabled=false.
+        # Refusing would be indistinguishable from an outage, and a probe is
+        # built to ride those out by carrying on with what it has — so the
+        # only way to make it stop is to tell it.
         return JSONResponse(build_document(p, cfg.defaults, base_url=cfg.base_url))
 
     @points.get("/api/points/{point}/configs/{kind}")
@@ -311,6 +315,11 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         point's secret; a point can only write as itself.
         """
         p = _auth_point(point, request)
+        if not p.enabled:
+            # Belt and braces: a probe that has not polled yet would still be
+            # pushing. Disabling takes effect on the next sample, not on the
+            # next poll.
+            raise HTTPException(403, "point is disabled")
         if cfg.relay is None:
             raise HTTPException(503, "relay is not configured")
         body = await request.body()

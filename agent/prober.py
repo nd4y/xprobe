@@ -920,6 +920,13 @@ def watch_control(control_url: str, point: str, token: str, current: int,
         except Exception as exc:
             print(f"control plane unreachable: {type(exc).__name__}: {exc}", flush=True)
             continue
+        if not doc.get("enabled", True):
+            # Checked on its own rather than through the version, so that being
+            # switched off stops the probe even if nothing else changed.
+            print("this point was DISABLED in the control plane — stopping", flush=True)
+            save_cache(doc)
+            stop.set()
+            return
         if int(doc.get("version") or 0) != current:
             print(f"document version {current} -> {doc.get('version')}, restarting", flush=True)
             save_cache(doc)
@@ -1040,14 +1047,16 @@ def resolve_identity(control_url: str) -> tuple[str, str]:
     sys.exit("control mode: no identity, no ENROLL_TOKEN and no POINT+CONTROL_TOKEN")
 
 
-def build_config(control_url: str) -> tuple[Config, str, str]:
+def build_config(control_url: str) -> tuple[Config | None, str, str]:
     """Assemble the configuration: from the control plane, the cache, or the
     environment.
 
     Returns (cfg, point, secret) — the name and secret are needed by the
-    version watcher and the geo report. Source order: the control plane is the
-    truth; the cache keeps a running point alive while the control plane is
-    down; the environment is the legacy mode for local scraping and tests.
+    version watcher and the geo report. `cfg` is None when the control plane
+    says this point is disabled: there is nothing to build, and the caller
+    stands the probe down. Source order: the control plane is the truth; the
+    cache keeps a running point alive while the control plane is down; the
+    environment is the legacy mode for local scraping and tests.
     """
     if not control_url:
         return Config.from_env(), "", ""
@@ -1056,15 +1065,43 @@ def build_config(control_url: str) -> tuple[Config, str, str]:
     try:
         doc = fetch_document(control_url, point, secret)
         save_cache(doc)
+        if not doc.get("enabled", True):
+            return None, point, secret
         print(f"configuration from the control plane, version {doc.get('version')}", flush=True)
         return Config.from_document(doc, point=point, push_password=secret), point, secret
     except Exception as exc:  # noqa: BLE001 — network / non-JSON, all failures equal
         print(f"control plane unreachable at startup: {exc}", flush=True)
     cached = load_cache()
     if cached is not None:
+        if not cached.get("enabled", True):
+            # Cached as disabled: do not resume probing just because the
+            # control plane is unreachable at the moment.
+            return None, point, secret
         print(f"configuration from cache, version {cached.get('version')}", flush=True)
         return Config.from_document(cached, point=point, push_password=secret), point, secret
     sys.exit("control plane unreachable and no cache — the point is not configured")
+
+
+def idle_until_enabled(control_url: str, point: str, secret: str, interval: int) -> None:
+    """Stand down: the control plane says this point is disabled.
+
+    Everything stops — no tunnels are opened, no metrics are sent. The process
+    stays alive and keeps asking, because exiting would just be restarted by
+    the container's restart policy into the same state, and because a point
+    that is switched back on should come back by itself.
+    """
+    print("this point is DISABLED in the control plane — standing down", flush=True)
+    while True:
+        time.sleep(interval)
+        try:
+            doc = fetch_document(control_url, point, secret)
+        except Exception as exc:  # noqa: BLE001 — network, keep waiting
+            print(f"control plane unreachable while standing down: {exc}", flush=True)
+            continue
+        if doc.get("enabled", True):
+            save_cache(doc)
+            print("re-enabled — restarting to pick the configuration back up", flush=True)
+            return
 
 
 def main() -> None:
@@ -1072,6 +1109,10 @@ def main() -> None:
     control_interval = env_int("CONTROL_INTERVAL", 60)
 
     cfg, point, secret = build_config(control_url)
+    if cfg is None:
+        # Disabled: build_config resolved the identity but built nothing.
+        idle_until_enabled(control_url, point, secret, control_interval)
+        return
     state = State()
     stop = threading.Event()
 
