@@ -57,8 +57,10 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
         elif kind == "download":
             spec["start_port"] = 20500
             spec["timeout"] = 60
-            spec["min_bytes"] = d.download_min_bytes
-            spec["url"] = d.download_url
+            # Volume tolerance: how much has to get through before DPI cuts
+            # the tunnel. Per point, because the answer differs by network.
+            spec["min_bytes"] = point.download_min_bytes or d.download_min_bytes
+            spec["url"] = point.download_url or d.download_url
         else:  # tcp
             spec["timeout"] = 10
         probes[kind] = spec
@@ -87,6 +89,8 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
         "ip_url": d.ip_url,
         "isp_url": d.isp_url,
         "exit_expectations": point.exit_expectations or d.exit_expectations,
+        "jitter": d.jitter,
+        "spread": d.spread,
     }
     if point.push_enabled:
         # Metrics go to the control-plane relay, not to the store directly:

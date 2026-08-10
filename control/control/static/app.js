@@ -11,9 +11,9 @@ const MODES = ['tcp', 'status', 'download'];
 // it); the UI calls the check `http` — that is what it actually does.
 const MODE_LABEL = { tcp: 'tcp', status: 'http', download: 'download' };
 const MODE_HINT = {
-  tcp: 'connect + TLS handshake to the inbound',
-  status: 'HTTP request through the config',
-  download: 'file download, measures bandwidth',
+  tcp: 'connect + TLS handshake to the inbound — the latency floor, before the tunnel',
+  status: 'HTTP request through the config; minus tcp it gives the latency added past the entry',
+  download: 'how much data the tunnel lets through before it is cut',
 };
 const DEF_INT = { tcp: 300, status: 300, download: 1800 };
 
@@ -207,10 +207,17 @@ async function pointView(name) {
 
   // — checks —
   const modeBoxes = {}; const intBoxes = {};
+  // Volume tolerance: the download check proves how much gets through before
+  // the tunnel is cut, so both the source file and the volume are per point.
+  const dlUrl = el('input', { value: p.download_url || '', placeholder: 'default source' });
+  const dlMiB = el('input', { type: 'number', min: '0', step: '1',
+    value: p.download_min_bytes ? String(Math.round(p.download_min_bytes / 1048576)) : '',
+    placeholder: '0.5' });
+
   const checksCard = el('div', { class: 'card' }, [
     el('div', { class: 'section-title' }, [
       el('h3', {}, 'Checks'),
-      el('div', { class: 'muted' }, 'Each check runs on its own schedule; tcp and http run concurrently.'),
+      el('div', { class: 'muted' }, 'Each check runs on its own schedule; tcp and http run concurrently, so their latencies are comparable.'),
     ]),
     ...MODES.map((m) => {
       const sw = mswitch(!!p.modes[m]);
@@ -225,6 +232,12 @@ async function pointView(name) {
           el('span', { class: 'muted' }, 's')]),
       ]);
     }),
+    el('div', { class: 'grid' }, [
+      el('label', { class: 'field' }, [el('span', {}, 'volume to push, MiB'), dlMiB]),
+      el('label', { class: 'field' }, [el('span', {}, 'volume test source'), dlUrl]),
+    ]),
+    el('div', { class: 'muted' },
+      'The source file must be at least as large as the volume — the check proves the tunnel survives that much, not how fast it is.'),
   ]);
 
   // — targets: one table, a checkbox column per check —
@@ -326,6 +339,8 @@ async function pointView(name) {
           pin_geo: pinGeo.input.checked, enabled: enabled.input.checked,
           modes: Object.fromEntries(MODES.map((m) => [m, modeBoxes[m].checked])),
           intervals: Object.fromEntries(MODES.map((m) => [m, Number(intBoxes[m].value) || 0])),
+          download_url: dlUrl.value.trim(),
+          download_min_bytes: Math.round((Number(dlMiB.value) || 0) * 1048576),
         },
       });
       await api(`/admin/points/${encodeURIComponent(name)}/set`, {

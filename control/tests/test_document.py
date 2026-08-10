@@ -76,6 +76,23 @@ def test_push_is_absent_without_any_target():
     assert "push" not in build_document(point(push_enabled=True), DEF)
 
 
+def test_volume_test_settings_are_per_point():
+    # The download check proves how much a tunnel lets through before DPI
+    # cuts it, so the volume and its source belong to the point's network.
+    doc = build_document(point(download_url="https://host/10Mb.dat",
+                               download_min_bytes=10 * 1024**2), DEF)
+    assert doc["probes"]["download"]["url"] == "https://host/10Mb.dat"
+    assert doc["probes"]["download"]["min_bytes"] == 10 * 1024**2
+    # Unset — the fleet default.
+    plain = build_document(point(), DEF)
+    assert plain["probes"]["download"]["min_bytes"] == DEF.download_min_bytes
+
+
+def test_document_carries_timing_camouflage():
+    doc = build_document(point(), DEF)
+    assert doc["jitter"] == DEF.jitter and doc["spread"] == DEF.spread
+
+
 def test_own_exit_expectations_win_over_defaults():
     doc = build_document(point(exit_expectations={"WARP": "1.2.3."}), DEF)
     assert doc["exit_expectations"] == {"WARP": "1.2.3."}

@@ -45,6 +45,7 @@ import base64
 import contextlib
 import json
 import os
+import random
 import re
 import socket
 import ssl
@@ -92,6 +93,12 @@ class Probe:
     url: str                       # what to request through the config
     min_bytes: int = 0             # download: how many bytes count as success
     subscription_interval: int = 300
+    # Timing camouflage. `jitter` varies the round period; `spread` is the
+    # fraction of the period the configs of one round are scattered over.
+    # Both exist because a probe that fires on the dot, in a fixed order, is
+    # trivially distinguishable from a person using the same tunnels.
+    jitter: float = 0.2
+    spread: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -227,6 +234,8 @@ class Config:
                 url="" if kind == "tcp" else str(spec.get("url") or d.get("url", "")),
                 min_bytes=int(spec.get("min_bytes") or d.get("min_bytes", 0)),
                 subscription_interval=sub_interval,
+                jitter=float(spec.get("jitter", doc.get("jitter", 0.2))),
+                spread=float(spec.get("spread", doc.get("spread", 0.5))),
             ))
         if not probes:
             raise ValueError("the document has no enabled modes")
@@ -622,19 +631,37 @@ def run_probe(probe: Probe, state: State, cfg: Config, stop: threading.Event) ->
                     state.errors[probe.kind] = f"{type(exc).__name__}: {exc}"
                 print(f"[{probe.kind}] failed to read subscription: {exc}", flush=True)
 
-        for n, entry in enumerate(entries):
+        # Configs are visited in a random order and with a random gap between
+        # them, rather than back-to-back in a fixed rotation. Back-to-back is
+        # what makes a round look machine-made from the outside: a burst of N
+        # handshakes within seconds, in the same sequence, on the dot. The gap
+        # budget stays inside the round so the interval still means what it
+        # says.
+        order = list(range(len(entries)))
+        random.shuffle(order)
+        gap = 0.0
+        if order:
+            gap = probe.interval * probe.spread / len(order)
+        for n in order:
             if stop.is_set():
                 return
+            entry = entries[n]
             if probe.kind == "tcp":
                 res = probe_tcp(entry, probe, cfg)
             else:
+                # The port stays tied to the config's index: concurrent modes
+                # must not land on the same port.
                 res = probe_one(entry, probe.start_port + n, probe, cfg)
             with state.lock:
                 state.results[(probe.kind, res.name)] = res
+            if gap and stop.wait(random.uniform(0, 2 * gap)):
+                return
 
         # A round takes time by itself — sleep the remainder of the interval,
-        # not on top of it.
-        stop.wait(max(5.0, probe.interval - (time.time() - started)))
+        # not on top of it. The remainder carries the jitter: without it every
+        # round would start on the same second forever.
+        target = probe.interval * random.uniform(1 - probe.jitter, 1 + probe.jitter)
+        stop.wait(max(5.0, target - (time.time() - started)))
 
 
 def escape(value: str) -> str:
