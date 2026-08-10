@@ -22,6 +22,7 @@ class FakePanel:
         ]
         self.squads_ = []
         self.users = {}
+        self.sub_fetches: list[str] = []
         self._sq = 0
 
     def inbound_names(self):
@@ -49,6 +50,13 @@ class FakePanel:
              "subscriptionUrl": f"https://sub/{username}"}
         self.users[username] = u
         return u
+
+    def subscription(self, url, *, user_agent="v2rayNG/1.8.0"):
+        # Every account is in the one shared squad, so every subscription
+        # carries every host; the control plane is what narrows it down.
+        self.sub_fetches.append(url)
+        return [{"remarks": h.remark, "outbounds": [{"protocol": "vless"}]}
+                for h in self.hosts_]
 
     def patch_host(self, host):
         for i, h in enumerate(self.hosts_):
@@ -99,12 +107,12 @@ def basic(user, pw):
 
 def test_probe_fetches_its_document_with_its_secret(tmp_path):
     points, _, deps = build(tmp_path)
-    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c",
-                                        load_sub_url="https://s/l"), "sec")
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c"), "sec")
     r = points.get("/api/points/yar/config", headers=basic("yar", "sec"))
     assert r.status_code == 200
-    assert r.json()["point"] == "yar"
-    assert r.json()["subscriptions"]["check"] == "https://s/c"
+    doc = r.json()
+    assert doc["point"] == "yar"
+    assert doc["probes"]["tcp"]["configs_url"].endswith("/api/points/yar/configs/tcp")
 
 
 def test_foreign_secret_fetches_no_document(tmp_path):
@@ -185,7 +193,7 @@ def test_admin_api_is_owner_only(tmp_path):
     assert admin.get("/api/admin/points", cookies=guest).status_code == 403
 
 
-def test_provisioning_creates_squads_accounts_and_secret(tmp_path):
+def test_provisioning_creates_one_account_in_the_shared_squad(tmp_path):
     panel = FakePanel()
     _, admin, deps = build(tmp_path, panel=panel)
     r = admin.post("/api/admin/points", cookies=owner_cookie(), json={
@@ -197,14 +205,71 @@ def test_provisioning_creates_squads_accounts_and_secret(tmp_path):
     assert body["secret"]
     assert "docker run" in body["install"]["docker"]
     assert "kubectl apply" in body["install"]["kubectl"]
-    # Three squads and three accounts: tcp, http (check) and download (load).
-    assert len(panel.squads_) == 3
-    assert set(panel.users) == {"monitor_yaroslavl", "monitor_yaroslavl_load",
-                                "monitor_yaroslavl_tcp"}
-    # The point landed in the control plane with its subscription links saved.
+    # One squad for the whole fleet, one account for this point.
+    assert [s.name for s in panel.squads_] == ["Monitor"]
+    assert set(panel.users) == {"monitor_yaroslavl"}
+    # Target sets live in the control plane, not in panel squads.
     p = db.get_point(deps.conn, "yaroslavl")
     assert p.check_sub_url == "https://sub/monitor_yaroslavl"
-    assert p.tcp_sub_url == "https://sub/monitor_yaroslavl_tcp"
+    assert p.targets["status"] == ["RU · TLS", "RU · XHTTP"]
+    assert p.targets["download"] == ["RU · XHTTP"]
+
+
+def test_second_point_reuses_the_shared_squad(tmp_path):
+    panel = FakePanel()
+    _, admin, _ = build(tmp_path, panel=panel)
+    for name in ("yar", "tlt"):
+        r = admin.post("/api/admin/points", cookies=owner_cookie(),
+                       json={"name": name, "check_remarks": ["RU · TLS"], "load_remarks": []})
+        assert r.status_code == 200, r.text
+    assert len(panel.squads_) == 1
+    assert set(panel.users) == {"monitor_yar", "monitor_tlt"}
+
+
+def test_configs_endpoint_returns_only_the_check_s_targets(tmp_path):
+    panel = FakePanel()
+    points, admin, deps = build(tmp_path, panel=panel)
+    admin.post("/api/admin/points", cookies=owner_cookie(), json={
+        "name": "yar", "tcp_remarks": ["RU · TLS", "RU · XHTTP"],
+        "check_remarks": ["RU · TLS"], "load_remarks": ["RU · XHTTP"]})
+    secret = "s3cret"
+    db.rotate_secret(deps.conn, "yar", secret)
+
+    got = {}
+    for kind in ("tcp", "status", "download"):
+        r = points.get(f"/api/points/yar/configs/{kind}", headers=basic("yar", secret))
+        assert r.status_code == 200, r.text
+        got[kind] = [c["remarks"] for c in r.json()]
+    assert got["tcp"] == ["RU · TLS", "RU · XHTTP"]
+    assert got["status"] == ["RU · TLS"]
+    assert got["download"] == ["RU · XHTTP"]
+
+
+def test_configs_are_not_served_to_a_foreign_secret(tmp_path):
+    points, _, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c"), "sec")
+    assert points.get("/api/points/yar/configs/tcp",
+                      headers=basic("yar", "wrong")).status_code == 401
+
+
+def test_a_disabled_point_gets_no_configs(tmp_path):
+    points, _, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", enabled=False,
+                                        check_sub_url="https://s/c"), "sec")
+    assert points.get("/api/points/yar/configs/tcp",
+                      headers=basic("yar", "sec")).status_code == 404
+
+
+def test_subscription_is_cached_between_checks(tmp_path):
+    # Three checks poll far more often than the panel's answer changes.
+    panel = FakePanel()
+    points, admin, deps = build(tmp_path, panel=panel)
+    admin.post("/api/admin/points", cookies=owner_cookie(),
+               json={"name": "yar", "check_remarks": ["RU · TLS"], "load_remarks": []})
+    db.rotate_secret(deps.conn, "yar", "sec")
+    for kind in ("tcp", "status", "download"):
+        points.get(f"/api/points/yar/configs/{kind}", headers=basic("yar", "sec"))
+    assert len(panel.sub_fetches) == 1
 
 
 def test_run_command_for_existing_point_rotates_and_returns_both_flavors(tmp_path):
@@ -221,20 +286,40 @@ def test_run_command_for_existing_point_rotates_and_returns_both_flavors(tmp_pat
     assert db.get_secret_hash(deps.conn, "yar") != before   # rotated
 
 
-def test_legacy_point_gains_a_tcp_set_on_first_save(tmp_path):
-    # A point created before the tcp set existed has empty tcp_* columns; the
-    # first target save must provision the tcp squad and migrate it.
+def test_legacy_point_targets_are_read_from_its_old_squads(tmp_path):
+    # A point provisioned before the control plane filtered configs kept its
+    # sets as squad membership. Reading them back on first use is what lets
+    # the fleet switch over without a migration step.
     panel = FakePanel()
     _, admin, deps = build(tmp_path, panel=panel)
-    db.create_point(deps.conn, db.Point(name="yar", check_squad="", load_squad=""), "sec")
-    assert db.get_point(deps.conn, "yar").tcp_squad == ""
+    http_squad = panel.create_squad("Monitor-yar-check", ["i-tls"])
+    load_squad = panel.create_squad("Monitor-yar-load", ["i-xhttp"])
+    db.create_point(deps.conn, db.Point(name="yar", check_squad=http_squad,
+                                        load_squad=load_squad), "sec")
+    r = admin.get("/api/admin/points/yar", cookies=owner_cookie())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["check_remarks"] == ["RU · TLS"]
+    assert body["load_remarks"] == ["RU · XHTTP"]
+    assert body["tcp_remarks"] == ["RU · TLS"]     # tcp inherits http
+
+
+def test_saving_targets_writes_nothing_to_the_panel(tmp_path):
+    # The whole point of the switch: target edits stop touching live host
+    # objects in the panel.
+    panel = FakePanel()
+    _, admin, deps = build(tmp_path, panel=panel)
+    db.create_point(deps.conn, db.Point(name="yar"), "sec")
+    before = [list(s.inbounds) for s in panel.squads_]
+    hosts_before = [(h.uuid, list(h.excluded)) for h in panel.hosts_]
     r = admin.post("/api/admin/points/yar/set", cookies=owner_cookie(),
-                   json={"tcp_remarks": ["RU · TLS"], "check_remarks": ["RU · TLS"],
+                   json={"tcp_remarks": ["RU · TLS"], "check_remarks": ["RU · XHTTP"],
                          "load_remarks": []})
     assert r.status_code == 200
+    assert [list(s.inbounds) for s in panel.squads_] == before
+    assert [(h.uuid, list(h.excluded)) for h in panel.hosts_] == hosts_before
     p = db.get_point(deps.conn, "yar")
-    assert p.tcp_squad and p.tcp_account == "monitor_yar_tcp"
-    assert p.tcp_sub_url == "https://sub/monitor_yar_tcp"
+    assert p.targets == {"tcp": ["RU · TLS"], "status": ["RU · XHTTP"], "download": []}
 
 
 def test_malformed_point_name_is_rejected(tmp_path):
@@ -298,11 +383,10 @@ def _token(admin):
     return admin.get("/api/admin/enroll-token", cookies=owner_cookie()).json()["token"]
 
 
-def test_node_enrolls_and_gets_its_own_squads_and_subscriptions(tmp_path):
+def test_node_enrolls_and_gets_its_own_account(tmp_path):
     # Zero-touch: the operator configures nothing, so the control plane
-    # provisions EVERYTHING for the point — its own pair of squads and
-    # accounts with the default target set. A shared subscription would tie
-    # the inbound sets of unrelated points together.
+    # provisions everything. Its own account rather than a fleet-wide one —
+    # that is what lets one node be cut off without disturbing the others.
     panel = FakePanel()
     points, admin, deps = build(tmp_path, panel=panel)
     r = points.post("/api/enroll", json={"token": _token(admin), "node_id": "abc123"})
@@ -311,8 +395,9 @@ def test_node_enrolls_and_gets_its_own_squads_and_subscriptions(tmp_path):
     p = db.get_point(deps.conn, body["point"])
     assert p.node_id == "abc123"
     assert p.check_account == f"monitor_{body['point']}"
-    assert p.check_sub_url and p.load_sub_url and p.tcp_sub_url  # subs exist right away
-    assert len(panel.squads_) == 3                 # tcp + http + download
+    assert p.check_sub_url                          # its own subscription
+    assert p.targets["status"] == list(("RU · TLS", "RU · XHTTP"))
+    assert [s.name for s in panel.squads_] == ["Monitor"]
 
 
 def test_two_nodes_get_different_subscriptions(tmp_path):

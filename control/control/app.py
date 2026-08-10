@@ -21,6 +21,7 @@ import hmac
 import logging
 import re
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,7 @@ from . import db, sessions
 from .config import Config
 from .document import build_document
 from .oidc import OIDC, new_state
-from .panel import Panel, plan_squad_membership
+from .panel import Panel
 
 log = logging.getLogger("xprobe-control")
 STATIC = Path(__file__).parent / "static"
@@ -55,6 +56,9 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
     points = FastAPI(title="xprobe-control points")
     admin = FastAPI(title="xprobe-control admin")
     cfg = deps.cfg
+    # point name -> (fetched_at, configs). In memory only: it is a cache of
+    # someone else's data, and losing it on restart costs one fetch.
+    _sub_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
     # ── administrator sign-in ───────────────────────────────────────────────
 
@@ -188,6 +192,29 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             raise HTTPException(404, "point is disabled or does not exist")
         return JSONResponse(build_document(p, cfg.defaults, base_url=cfg.base_url))
 
+    @points.get("/api/points/{point}/configs/{kind}")
+    def point_configs(point: str, kind: str, request: Request) -> JSONResponse:
+        """The configs one check of one point should probe.
+
+        The control plane reads the point's subscription and returns only the
+        configs its target set names. A probe therefore never talks to the
+        panel, never holds a subscription link, and never receives a config
+        outside its own set.
+        """
+        p = _auth_point(point, request)
+        if kind not in ("tcp", "status", "download"):
+            raise HTTPException(404, "unknown check")
+        if not p.enabled:
+            raise HTTPException(404, "point is disabled")
+        if not p.check_sub_url:
+            raise HTTPException(409, "the point has no subscription yet")
+        wanted = set(_targets_of(p).get(kind) or [])
+        try:
+            configs = _subscription(p)
+        except Exception as exc:  # noqa: BLE001 — panel/network, one failure mode
+            raise HTTPException(502, f"subscription unavailable: {exc}") from exc
+        return JSONResponse([c for c in configs if c.get("remarks") in wanted])
+
     # ── enroll: zero-touch node registration ────────────────────────────────
 
     @points.post("/api/enroll")
@@ -217,10 +244,13 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         # node_id, suffixed for uniqueness. The geo report will refine it.
         base = _slug(geo.get("city") or "") or f"node-{node_id[:6]}"
         name = _unique_name(base)
-        # Every point gets its own pair of squads and accounts — exactly like
-        # manual provisioning. A shared subscription would tie the inbound sets
-        # of unrelated points together.
-        prov = _provision(name, set(cfg.default_check_remarks), set(cfg.default_load_remarks))
+        # Its own account in the shared squad — exactly like manual
+        # provisioning, so an auto-enrolled node can be cut off on its own.
+        prov = _provision(name, {
+            "tcp": list(cfg.default_check_remarks),
+            "status": list(cfg.default_check_remarks),
+            "download": list(cfg.default_load_remarks),
+        })
         point = db.Point(
             name=name, node_id=node_id, vantage="home",
             country=str(geo.get("country") or ""), city=str(geo.get("city") or ""),
@@ -283,14 +313,10 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         if p is None:
             raise HTTPException(404, "point not found")
         out = p.public()
-        # The current target sets are computed from the panel so the checkboxes
-        # in the UI reflect reality, not whatever was recorded once. A point
-        # provisioned before the tcp set existed inherits the http targets
-        # until its own set is first saved.
-        out["check_remarks"] = _squad_remarks(p.check_squad)
-        out["load_remarks"] = _squad_remarks(p.load_squad)
-        out["tcp_remarks"] = (_squad_remarks(p.tcp_squad) if p.tcp_squad
-                              else out["check_remarks"])
+        t = _targets_of(p)
+        out["tcp_remarks"] = t.get("tcp") or []
+        out["check_remarks"] = t.get("status") or []
+        out["load_remarks"] = t.get("download") or []
         return out
 
     @admin.patch("/api/admin/points/{name}")
@@ -302,27 +328,19 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
 
     @admin.post("/api/admin/points/{name}/set")
     def admin_set(name: str, payload: dict[str, Any], _: dict = Depends(require_owner)) -> dict:
-        """Set the point's target sets: edits its squads' membership in the panel."""
+        """Set the point's target sets. Writes nothing to the panel: the sets
+        are a control-plane concept, applied when configs are filtered."""
         p = db.get_point(deps.conn, name)
         if p is None:
             raise HTTPException(404, "point not found")
-        check = set(payload.get("check_remarks") or [])
-        load = set(payload.get("load_remarks") or [])
-        tcp = set(payload.get("tcp_remarks") or [])
-        _apply_set(p.check_squad, check)
-        _apply_set(p.load_squad, load)
-        extra: dict[str, Any] = {}
-        if p.tcp_squad:
-            _apply_set(p.tcp_squad, tcp)
-        else:
-            # The point predates the tcp set — provision it on first save so
-            # legacy points migrate the moment their targets are edited.
-            squad, account, url = _make_set(p.name, "tcp", tcp)
-            extra = {"tcp_squad": squad, "tcp_account": account, "tcp_sub_url": url}
-        # Bump the version: the set changed. The probe re-reads the subscription
-        # on its own, but the document version is how the control plane can see
-        # the change went out.
-        version = db.update_point(deps.conn, name, {"note": p.note, **extra})
+        targets = {
+            "tcp": sorted(set(payload.get("tcp_remarks") or [])),
+            "status": sorted(set(payload.get("check_remarks") or [])),
+            "download": sorted(set(payload.get("load_remarks") or [])),
+        }
+        # Bump the version so the change is visible from the control plane
+        # without waiting for the probe's behaviour to shift.
+        version = db.update_point(deps.conn, name, {"targets": targets})
         return {"ok": True, "version": version}
 
     @admin.post("/api/admin/points/{name}/rotate-secret")
@@ -349,8 +367,8 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
 
     @admin.post("/api/admin/points")
     def admin_create(payload: dict[str, Any], _: dict = Depends(require_owner)) -> dict:
-        """Provision a point: panel squads and accounts, a control-plane record,
-        and an install command."""
+        """Provision a point: an account in the shared squad, a control-plane
+        record, and an install command."""
         name = str(payload.get("name") or "").strip()
         if not NAME_RE.match(name):
             raise HTTPException(400, "name: lowercase latin/digits/hyphen, 2-31 chars")
@@ -359,13 +377,18 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
 
         check_remarks = set(payload.get("check_remarks") or [])
         load_remarks = set(payload.get("load_remarks") or [])
+        tcp_remarks = set(payload.get("tcp_remarks") or []) or check_remarks
         hosts = deps.panel.hosts()
         known = {h.remark for h in hosts}
-        unknown = (check_remarks | load_remarks) - known
+        unknown = (check_remarks | load_remarks | tcp_remarks) - known
         if unknown:
             raise HTTPException(400, f"unknown hosts: {', '.join(sorted(unknown))}")
 
-        prov = _provision(name, check_remarks, load_remarks)
+        prov = _provision(name, {
+            "tcp": sorted(tcp_remarks),
+            "status": sorted(check_remarks),
+            "download": sorted(load_remarks),
+        })
 
         # The point's secret: the probe both fetches the document and pushes
         # metrics with it.
@@ -418,6 +441,20 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
+    def _subscription(p: db.Point) -> list[dict[str, Any]]:
+        """The point's configs, briefly cached.
+
+        Probes ask far more often than the panel's answer changes, and each
+        point has its own credentials, so the cache is per point.
+        """
+        now = time.time()
+        hit = _sub_cache.get(p.name)
+        if hit is not None and now - hit[0] < cfg.defaults.subscription_interval:
+            return hit[1]
+        configs = deps.panel.subscription(p.check_sub_url)
+        _sub_cache[p.name] = (now, configs)
+        return configs
+
     def _enroll_token() -> str:
         token = db.get_setting(deps.conn, "enroll_token")
         if not token:
@@ -445,37 +482,43 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             raise HTTPException(404, "point not found")
         return p
 
-    def _make_set(name: str, kind: str, remarks: set[str]) -> tuple[str, str, str]:
-        """One target set = one squad + one account. Returns (squad, account, url)."""
-        hosts = deps.panel.hosts()
-        inbounds, _ = plan_squad_membership("", hosts, remarks)
-        squad = deps.panel.create_squad(f"Monitor-{name}-{kind}", inbounds)
-        # Exclusions are applied once the squad uuid is known.
-        _apply_set(squad, remarks)
-        suffix = "" if kind == "check" else f"_{kind}"
-        user = deps.panel.create_user(
-            username=f"monitor_{name}{suffix}", squads=[squad], tag="MONITOR",
-            description=f"xprobe {name} {kind}")
-        return squad, user["username"], user.get("subscriptionUrl") or ""
+    def _shared_squad() -> str:
+        """The one squad every monitoring account belongs to, holding every inbound.
 
-    def _provision(name: str, check_remarks: set[str], load_remarks: set[str]) -> dict[str, Any]:
-        """Create the point's own monitoring squads and accounts in the panel.
-
-        Shared between manual provisioning and auto-enroll: every point gets
-        its own target sets and its own subscriptions — shared ones would tie
-        the inbound sets of unrelated points together, which is exactly what
-        separate sets exist to avoid. Three sets per point: tcp, http (the
-        historical `check`) and download (`load`); tcp starts with the same
-        targets as http.
+        One squad instead of one per point and per check: what a point probes
+        is decided by the control plane when it filters configs, so the panel
+        needs no per-point structure at all — and target edits stop writing to
+        the panel entirely, which is where the sharp edges were (a host PATCH
+        drops fields absent from the body, and hosts sharing an inbound had to
+        be hidden with exclusions).
         """
-        check_squad, check_account, check_url = _make_set(name, "check", check_remarks)
-        load_squad, load_account, load_url = _make_set(name, "load", load_remarks)
-        tcp_squad, tcp_account, tcp_url = _make_set(name, "tcp", check_remarks)
+        want = cfg.shared_squad_name
+        for s in deps.panel.squads():
+            if s.name == want:
+                return s.uuid
+        inbounds = sorted({h.inbound_uuid for h in deps.panel.hosts() if h.inbound_uuid})
+        squad = deps.panel.create_squad(want, inbounds)
+        log.info("created the shared monitoring squad %s with %d inbounds", want, len(inbounds))
+        return squad
+
+    def _provision(name: str, targets: dict[str, list[str]]) -> dict[str, Any]:
+        """Give the point its own account in the shared squad.
+
+        Shared between manual provisioning and auto-enroll. One account per
+        point rather than one for the whole fleet: probes run on machines
+        other people control, and a per-point identity is what makes it
+        possible to cut off one point — or read its traffic — without
+        touching the rest.
+        """
+        squad = _shared_squad()
+        user = deps.panel.create_user(
+            username=f"monitor_{name}", squads=[squad], tag="MONITOR",
+            description=f"xprobe {name}")
         return {
-            "check_account": check_account, "load_account": load_account,
-            "tcp_account": tcp_account,
-            "check_squad": check_squad, "load_squad": load_squad, "tcp_squad": tcp_squad,
-            "check_sub_url": check_url, "load_sub_url": load_url, "tcp_sub_url": tcp_url,
+            "check_account": user["username"],
+            "check_squad": squad,
+            "check_sub_url": user.get("subscriptionUrl") or "",
+            "targets": targets,
         }
 
     def _slug(text: str) -> str:
@@ -493,6 +536,8 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         return f"{base}-{secrets.token_hex(3)}"
 
     def _squad_remarks(squad_uuid: str) -> list[str]:
+        """Hosts a legacy per-check squad exposes. Only used to migrate a point
+        whose targets still live in the panel rather than in `targets`."""
         if not squad_uuid:
             return []
         squads = {s.uuid: s for s in deps.panel.squads()}
@@ -505,15 +550,21 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             if h.inbound_uuid in inbounds and squad_uuid not in h.excluded and h.remark
         )
 
-    def _apply_set(squad_uuid: str, remarks: set[str]) -> None:
-        hosts = deps.panel.hosts()
-        inbounds, changed = plan_squad_membership(squad_uuid, hosts, remarks)
-        deps.panel.set_squad_inbounds(squad_uuid, inbounds)
-        by_uuid = {h.uuid: h for h in hosts}
-        for host_uuid, excluded in changed.items():
-            host = by_uuid[host_uuid]
-            host.excluded = excluded
-            deps.panel.patch_host(host)
+    def _targets_of(p: db.Point) -> dict[str, list[str]]:
+        """The point's target sets, migrating a legacy point on first read.
+
+        Points provisioned before the control plane filtered configs kept
+        their sets as squad membership. Reading them back once, here, means
+        the switch needs no migration step and no downtime.
+        """
+        if p.targets:
+            return {k: list(v) for k, v in p.targets.items()}
+        http = _squad_remarks(p.check_squad)
+        return {
+            "tcp": _squad_remarks(p.tcp_squad) or http,
+            "status": http,
+            "download": _squad_remarks(p.load_squad),
+        }
 
     def _install_commands(name: str, secret: str) -> dict[str, str]:
         """Ready-to-paste run commands for the point, docker and kubernetes."""

@@ -6,11 +6,15 @@ none of this is documented):
 * a user is addressed by `username` or numeric `id`; there is no `uuid` field,
   and `shortUuid` is the subscription-link key, not a record identifier;
 * `activeInternalSquads` in `PATCH /api/users` replaces the whole set;
-* `PATCH /api/hosts` RESETS fields absent from the body — so a host is written
-  whole: read the object, change one field, write it back;
 * a host is visible in a squad when its inbound belongs to the squad AND the
-  squad is not listed in the host's `excludedInternalSquads`. Both levers are
-  needed because one inbound serves several hosts.
+  squad is not listed in the host's `excludedInternalSquads`. Both are read
+  here only to migrate points whose target sets still live in panel squads.
+
+**This client cannot modify hosts, by design.** Target sets are applied by
+filtering configs in the control plane, so nothing about monitoring needs to
+write to a live host object — and `PATCH /api/hosts` silently resets every
+field absent from the body, which made that the sharpest edge in the system.
+The methods that could do it were removed rather than left unused.
 """
 
 from __future__ import annotations
@@ -45,11 +49,16 @@ class Squad:
 
 
 class Panel:
-    def __init__(self, base_url: str, token: str, *, client: httpx.Client | None = None) -> None:
+    def __init__(self, base_url: str, token: str, *, client: httpx.Client | None = None,
+                 sub_client: httpx.Client | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self._client = client or httpx.Client(
             timeout=30.0, headers={"Authorization": f"Bearer {token}"}
         )
+        # Subscriptions are fetched WITHOUT the admin token: the subscription
+        # host need not be the API host, and an admin token has no business
+        # travelling anywhere it is not required.
+        self._sub_client = sub_client or httpx.Client(timeout=30.0)
 
     def _resp(self, method: str, path: str, **kw: Any) -> Any:
         r = self._client.request(method, f"{self.base_url}{path}", **kw)
@@ -66,6 +75,25 @@ class Panel:
             for i in prof.get("inbounds", []):
                 names[i["uuid"]] = f"{prof.get('name')}/{i.get('tag')}"
         return names
+
+    def subscription(self, url: str, *, user_agent: str = "v2rayNG/1.8.0") -> list[dict[str, Any]]:
+        """Fetch a subscription and return its configs.
+
+        The control plane reads subscriptions itself and hands probes only the
+        configs their target set names — so a probe never talks to the panel
+        and never receives configs it has no business holding.
+
+        The subscription must come back in xray-json form; a share-link body
+        loses the XHTTP `extra` block, and such a config cannot work behind a
+        CDN.
+        """
+        r = self._sub_client.get(url, headers={"User-Agent": user_agent})
+        if r.status_code >= 400:
+            raise PanelError("GET", "<subscription>", r.status_code, r.text)
+        body = r.json()
+        if not isinstance(body, list):
+            raise PanelError("GET", "<subscription>", 200, "not a config list")
+        return [c for c in body if c.get("outbounds")]
 
     def squads(self) -> list[Squad]:
         data = self._resp("GET", "/api/internal-squads")
@@ -108,9 +136,6 @@ class Panel:
         squad = resp.get("internalSquad") or resp
         return squad["uuid"]
 
-    def set_squad_inbounds(self, uuid: str, inbounds: list[str]) -> None:
-        self._resp("PATCH", "/api/internal-squads", json={"uuid": uuid, "inbounds": inbounds})
-
     def create_user(
         self, *, username: str, squads: list[str], tag: str, description: str,
         expire_at: str = "2099-01-01T00:00:00.000Z",
@@ -127,40 +152,3 @@ class Panel:
 
     def delete_user(self, user_id: int) -> None:
         self._resp("DELETE", f"/api/users/{user_id}")
-
-    def patch_host(self, host: Host) -> None:
-        """Write the host whole: PATCH resets everything absent from the body."""
-        body = dict(host.raw)
-        body["excludedInternalSquads"] = host.excluded
-        self._resp("PATCH", "/api/hosts", json=body)
-
-
-def plan_squad_membership(
-    squad_uuid: str, hosts: list[Host], desired_remarks: set[str]
-) -> tuple[list[str], dict[str, list[str]]]:
-    """What it takes for the squad to expose exactly the desired_remarks hosts.
-
-    A pure function: it decides and performs nothing — which is why it is the
-    thing to test exhaustively; it is the only place that could show a point
-    the wrong target set.
-
-    Returns (squad inbounds, {host_uuid: new excludedInternalSquads}) — only
-    for hosts whose exclusion list actually changes.
-    """
-    desired = [h for h in hosts if h.remark in desired_remarks]
-    inbounds = sorted({h.inbound_uuid for h in desired if h.inbound_uuid})
-
-    changed: dict[str, list[str]] = {}
-    for h in hosts:
-        if not h.inbound_uuid:
-            continue
-        in_squad_inbounds = h.inbound_uuid in inbounds
-        wanted = h.remark in desired_remarks
-        has_exclusion = squad_uuid in h.excluded
-        # A host shows up in the squad when its inbound is in the set AND no
-        # exclusion exists. Adjust the exclusion so visibility matches intent.
-        if in_squad_inbounds and wanted and has_exclusion:
-            changed[h.uuid] = [s for s in h.excluded if s != squad_uuid]
-        elif in_squad_inbounds and not wanted and not has_exclusion:
-            changed[h.uuid] = [*h.excluded, squad_uuid]
-    return inbounds, changed

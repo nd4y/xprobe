@@ -26,29 +26,17 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
         "tcp": d.tcp_interval, "status": d.status_interval, "download": d.download_interval,
     }
 
-    # Subscriptions: each check has its own target set. The `check` key is the
-    # http set's historical name and is kept as the tcp fallback — points
-    # provisioned before the tcp set existed have no tcp subscription yet.
-    subscriptions: dict[str, str] = {}
-    if point.check_sub_url:
-        subscriptions["check"] = point.check_sub_url
-    if point.load_sub_url:
-        subscriptions["load"] = point.load_sub_url
-    if point.tcp_sub_url:
-        subscriptions["tcp"] = point.tcp_sub_url
-
-    sub_key = {
-        "tcp": "tcp" if point.tcp_sub_url else "check",
-        "status": "check",
-        "download": "load",
-    }
     probes: dict[str, Any] = {}
     for kind in MODES:
         enabled = bool(point.modes.get(kind, False))
         spec: dict[str, Any] = {
             "enabled": enabled,
             "interval": int(point.intervals.get(kind) or interval_default[kind]),
-            "subscription": sub_key[kind],
+            # Where the check's configs come from. The control plane filters
+            # them by the point's target set, so a probe never holds a
+            # subscription link and never sees a config outside its own set.
+            "configs_url": (f"{base_url}/api/points/{point.name}/configs/{kind}"
+                            if base_url else ""),
         }
         if kind == "status":
             spec["start_port"] = 20000
@@ -83,7 +71,6 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
         "version": point.version,
         "point": point.name,
         "labels": labels,
-        "subscriptions": subscriptions,
         "subscription_interval": d.subscription_interval,
         "probes": probes,
         "ip_url": d.ip_url,

@@ -31,16 +31,37 @@ from the control-plane UI.
 
 ## Security model
 
+Probes run on machines their operator does not own, and every config they
+handle is a working credential for someone else's tunnel. The design follows
+from that.
+
+* **Configs never touch a probe's disk.** The control plane hands each check
+  only the configs its target set names; they are held in memory and fed to
+  the core through a pipe. Nothing config-shaped is written to the node, so
+  there is nothing to leak, to forget to delete, or to find in a backup.
+  Encrypting a temp file would be theatre — the core has to be given
+  plaintext either way.
+* **One identity per point.** Each point has its own panel account, so a
+  single point can be cut off — or its traffic read — without disturbing the
+  rest of the fleet.
+* **The panel is read-only.** Target sets live in the control plane and are
+  applied by filtering, so no monitoring change ever writes to a live host or
+  squad.
 * The control plane serves **two ports**: a public one for probes
   (`/api/points/*`, `/api/enroll` — per-point secrets) and an internal one for
   the admin UI (local account, HTTP Basic). The public port has no admin
   routes at all.
-* Point secrets are stored hashed; each point can only fetch its own document
-  and push its own metrics.
+* Point secrets are stored hashed; each point can only fetch its own document,
+  its own configs, and push its own metrics.
 * Probes never learn the metrics store's address or credentials — metrics go
   through the control-plane relay with the same per-point secret.
 * A vantage node's IP is stored for diagnostics but never exposed — not in
   documents, not in the UI, not in metric labels.
+
+What this does **not** protect against: whoever has root on the machine a
+probe runs on can read its memory and its traffic. Nothing running on that
+machine can prevent that, which is why per-point revocation matters more than
+obfuscation.
 
 ## Development
 
