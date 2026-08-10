@@ -91,6 +91,73 @@ def test_a_check_with_a_missing_core_reports_instead_of_running(monkeypatch, tmp
     assert "v26.3.27" in res.error
 
 
+def test_a_fetched_core_must_match_its_checksum(monkeypatch, tmp_path):
+    # The checksum is what makes fetching a binary acceptable; failing it has
+    # to discard the download, not warn about it.
+    monkeypatch.setattr(prober, "CORE_CACHE", str(tmp_path / "cores"))
+    monkeypatch.setattr(prober, "urllib", prober.urllib)
+
+    class FakeResponse:
+        def __init__(self, blob):
+            self._blob = blob
+
+        def read(self):
+            return self._blob
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(prober.urllib.request, "urlopen",
+                        lambda *a, **k: FakeResponse(b"not a real release"))
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        prober.fetch_core("v26.7.28", "d" * 64)
+    assert not (tmp_path / "cores" / "v26.7.28" / "xray").exists()
+
+
+def test_a_core_without_a_checksum_is_never_fetched(monkeypatch, tmp_path):
+    monkeypatch.setattr(prober, "CORE_CACHE", str(tmp_path / "cores"))
+    with pytest.raises(ValueError, match="no checksum"):
+        prober.fetch_core("v26.7.28", "")
+
+
+def test_a_version_that_is_not_a_plain_name_is_refused(monkeypatch, tmp_path):
+    # The version becomes a path under the cache; with relaying enabled the
+    # control plane supplies both bytes and checksum, so "../.." would let it
+    # choose where the file lands. Refused before any network access.
+    monkeypatch.setattr(prober, "CORE_CACHE", str(tmp_path / "cores"))
+
+    def no_network(*a, **k):
+        raise AssertionError("must be refused before any fetch")
+
+    monkeypatch.setattr(prober.urllib.request, "urlopen", no_network)
+    for bad in ("../evil", "v1/..", "a\\b", ".hidden"):
+        with pytest.raises(ValueError, match="plain release tag"):
+            prober.fetch_core(bad, "a" * 64)
+    assert not (tmp_path / "cores").exists()
+
+
+def test_unused_cores_are_removed_but_the_image_is_left_alone(monkeypatch, tmp_path):
+    # Cached cores are tens of megabytes each; one that nothing asks for any
+    # more should not sit on someone else's disk forever. What the image
+    # carries is not ours to delete.
+    cache, baked = tmp_path / "cores", tmp_path / "image"
+    for root, version in ((cache, "v26.3.27"), (cache, "v26.7.28"), (baked, "v26.0.0")):
+        (root / version).mkdir(parents=True)
+        binary = root / version / "xray"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+    monkeypatch.setattr(prober, "CORE_CACHE", str(cache))
+    monkeypatch.setattr(prober, "XRAY_DIR", str(baked))
+
+    prober.ensure_cores({}, {"v26.7.28"})
+    assert (cache / "v26.7.28").exists()
+    assert not (cache / "v26.3.27").exists()      # nothing wants it now
+    assert (baked / "v26.0.0").exists()           # the image keeps its own
+
+
 def test_a_disabled_document_builds_nothing(monkeypatch, tmp_path):
     # The probe must stand down rather than keep its old configuration: this
     # is what makes disabling a point in the UI actually stop the node.

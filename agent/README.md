@@ -10,9 +10,10 @@ while nodes run 26.7.28, and XHTTP is incompatible between those versions: the
 config does not come up, the log shows nothing, the metric is simply red. It
 looks exactly like broken configs and takes half a day to chase.
 
-Here the core is a plain binary with the version set by a single `Dockerfile`
-line (`ARG XRAY_VERSION`). Node upgrade → image rebuild, and a divergence is
-plainly visible.
+Here the cores are plain binaries with the versions set by a single
+`Dockerfile` line (`ARG XRAY_VERSIONS`); more can be fetched at runtime from
+the control plane's catalogue, checksum-verified. Node upgrade → image
+rebuild, and a divergence is plainly visible.
 
 Second: **exit-address verification**. A WARP failure is masked by the
 `DIRECT` fallback — the connection comes up, the response arrives, every
@@ -80,10 +81,13 @@ xray_proxy_download_bytes{name,probe}         bytes received
 xray_proxy_download_speed_bytes{name,probe}   download speed
 xray_proxy_checked_timestamp_seconds{name,probe}
 xprobe_configs{probe} / xprobe_subscription_ok{probe}
+xprobe_check_core{probe,version}              which core a check runs with
+xprobe_check_runnable{probe}                  0 — the check cannot run (no such core)
+xprobe_config_ok / xprobe_config_version      the applied document
 ```
 
-The `probe` label (`status` | `download`) is set by the probe itself. The
-point's other labels come from `EXTRA_LABELS`.
+The `probe` label (`tcp` | `tunnel` | `status` | `download`) is set by the
+probe itself. The point's other labels come from `EXTRA_LABELS`.
 
 ## Two configuration models
 

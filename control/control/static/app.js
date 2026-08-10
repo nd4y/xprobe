@@ -86,6 +86,31 @@ function chip(text, cls = '') {
   return el('span', { class: `chip ${cls}` }, text);
 }
 
+function ago(seconds) {
+  if (seconds === null || seconds === undefined) return 'never';
+  const s = Math.round(seconds);
+  if (s < 90) return `${s} s ago`;
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 172800) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} d ago`;
+}
+
+// The threshold comes from the backend, derived from this point's own
+// cadence — a point on a slower schedule is not late for being slow.
+const HEALTH_CLASS = {
+  online: 'on', 'standing by': 'tonal', late: 'warnchip',
+  'no metrics': 'off', offline: 'off', never: 'off',
+};
+
+function healthChip(h) {
+  if (!h) return null;
+  if (h.state === 'never') return chip('never seen', 'off');
+  const detail = h.state === 'online' || h.state === 'late'
+    ? ago(h.metrics_ago ?? h.seen_ago)
+    : ago(h.seen_ago);
+  return chip(`${h.state} · ${detail}`, HEALTH_CLASS[h.state] || '');
+}
+
 function mswitch(checked, attrs = {}) {
   const input = el('input', { type: 'checkbox', checked, ...attrs });
   const wrap = el('label', { class: 'switch' }, [input, el('span', { class: 'track' })]);
@@ -138,6 +163,7 @@ async function listView() {
 
   const toolbar = el('div', { class: 'toolbar' }, [
     el('h2', { class: 'grow' }, `Vantage points (${points.length})`),
+    el('button', { class: 'tonal', onclick: showCores }, 'Cores'),
     el('button', { class: 'tonal', onclick: showTokens }, 'Enroll tokens'),
     el('button', { class: 'filled', onclick: addPoint }, '+ Add point'),
   ]);
@@ -151,7 +177,8 @@ async function listView() {
     }, [
       el('div', { class: 'row' }, [
         el('span', { class: 'point-name grow' }, p.name),
-        chip(p.enabled ? 'enabled' : 'disabled', p.enabled ? 'on' : 'off'),
+        p.enabled ? null : chip('disabled', 'off'),
+        healthChip(p.health),
       ]),
       el('div', { class: 'muted' }, [geo, p.isp].filter(Boolean).join(' · ') || 'location pending'),
       el('div', { class: 'chips' }, [
@@ -182,6 +209,7 @@ async function pointView(name) {
     el('button', { class: 'icon', onclick: () => { location.hash = '#/'; } }, '←'),
     el('h2', { class: 'mono' }, p.name),
     chip(`v${p.version}`),
+    healthChip(p.health),
     p.auto ? chip('auto-enrolled') : null,
     el('span', { class: 'grow' }),
     el('span', { class: 'muted' }, 'enabled'), enabled,
@@ -194,6 +222,22 @@ async function pointView(name) {
   const vantage = el('select', {}, ['home', 'node'].map((v) =>
     el('option', { value: v, ...(p.vantage === v ? { selected: '' } : {}) }, v)));
   const pinGeo = mswitch(p.pin_geo);
+  const h = p.health || {};
+  const healthCard = el('div', { class: 'card' }, [
+    el('div', { class: 'section-title' }, [
+      el('h3', {}, 'Liveness'),
+      el('div', { class: 'muted' },
+        `Expected every ${h.expect_every} s — this point's own push interval, not a fixed number.`),
+    ]),
+    el('div', { class: 'grid' }, [
+      el('div', {}, [el('div', { class: 'muted' }, 'last heard from'),
+        el('b', {}, ago(h.seen_ago))]),
+      el('div', {}, [el('div', { class: 'muted' }, 'last metrics'),
+        el('b', {}, h.expects_metrics ? ago(h.metrics_ago) : 'not expected')]),
+      el('div', {}, [el('div', { class: 'muted' }, 'state'), healthChip(h) || '—']),
+    ]),
+  ]);
+
   const locationCard = el('div', { class: 'card' }, [
     el('div', { class: 'section-title' }, [
       el('h3', {}, 'Location'),
@@ -214,11 +258,15 @@ async function pointView(name) {
   const modeBoxes = {}; const intBoxes = {};
   // Which cores this node carries, as the probe reported them, and any check
   // pointed at one it does not have.
-  const avail = p.xray_versions || [];
+  // What this node reports it can run, plus what the catalogue lets it fetch.
+  const reported = p.xray_versions || [];
+  const catalogue = (await api('/admin/cores')).cores.map((c) => c.version);
+  const avail = [...new Set([...reported, ...catalogue])].sort();
   const coreBoxes = {};
+  // Only a version that is neither on the node nor fetchable is a problem.
   const badCores = MODES.filter((m) => m !== 'tcp')
     .map((m) => (p.cores && p.cores[m]) || '')
-    .filter((v) => v && avail.length && !avail.includes(v));
+    .filter((v) => v && !avail.includes(v));
 
   // Volume tolerance: the download check proves how much gets through before
   // the tunnel is cut, so both the source file and the volume are per point.
@@ -261,9 +309,10 @@ async function pointView(name) {
       }
       return el('div', { class: 'check-row' }, row);
     }),
-    el('div', { class: 'muted' }, avail.length
-      ? `Cores this node carries: ${avail.join(', ')}.`
-      : 'This node has not reported which cores it carries yet.'),
+    el('div', { class: 'muted' }, reported.length
+      ? `On this node: ${reported.join(', ')}. Fetchable from the catalogue: ${
+          catalogue.filter((v) => !reported.includes(v)).join(', ') || 'nothing more'}.`
+      : 'This node has not reported its cores yet.'),
     ...(badCores.length ? [el('div', { class: 'warn' }, [
       el('b', {}, 'A check is set to a core this node does not have: '),
       badCores.join(', '),
@@ -403,10 +452,60 @@ async function pointView(name) {
   ]));
 
   render(head, el('div', { class: 'stack' },
-    [locationCard, checksCard, targetsCard, maintCard]), savebar);
+    [healthCard, locationCard, checksCard, targetsCard, maintCard]), savebar);
 }
 
 // ── dialogs ──────────────────────────────────────────────────────────────────
+
+// The core catalogue: which xray versions exist and what each must hash to.
+// Policy, not payload — a node fetches from a location built into itself and
+// verifies against this, so the control plane never ships code.
+async function showCores() {
+  const { cores, relay } = await api('/admin/cores');
+  const rows = cores.map((c) => el('div', { class: 'check-row' }, [
+    el('span', { class: 'grow' }, [
+      el('b', {}, c.version),
+      el('div', { class: 'in' }, c.sha256),
+    ]),
+    el('button', { class: 'small danger', onclick: () =>
+      confirmDialog(`Remove ${c.version} from the catalogue?`,
+        'Nodes that already fetched it keep it — this stops new fetches, it does not reach onto the nodes.',
+        'Remove', async () => {
+          await api(`/admin/cores/${encodeURIComponent(c.version)}`, { method: 'DELETE' });
+          toast('Removed'); showCores();
+        }) }, 'Remove'),
+  ]));
+  const relaySwitch = mswitch(relay);
+  relaySwitch.input.onchange = async () => {
+    await api('/admin/cores/relay', { method: 'POST',
+      body: { enabled: relaySwitch.input.checked } });
+    toast(relaySwitch.input.checked ? 'Relay on' : 'Relay off');
+  };
+  const version = el('input', { placeholder: 'v26.7.28' });
+  const sha = el('input', { placeholder: '64 hex characters' });
+  const add = el('button', { class: 'filled', onclick: async (e) => {
+    e.target.disabled = true;
+    try {
+      await api('/admin/cores', { method: 'POST',
+        body: { version: version.value.trim(), sha256: sha.value.trim() } });
+      toast('Added'); showCores();
+    } catch (err) { toast(String(err.message)); e.target.disabled = false; }
+  } }, 'Add');
+  dialog('xray cores', [
+    el('p', { class: 'muted' }, 'A node fetches a core it does not carry from the official XTLS release and refuses it unless the checksum matches. The download location is built into the probe — only the version and its checksum come from here.'),
+    ...(rows.length ? rows : [el('div', { class: 'muted' }, 'Nothing in the catalogue — checks can only use the cores baked into the image.')]),
+    el('div', { class: 'grid' }, [
+      el('label', { class: 'field' }, [el('span', {}, 'version'), version]),
+      el('label', { class: 'field' }, [el('span', {}, 'sha256 of Xray-linux-64.zip'), sha]),
+    ]),
+    el('div', { class: 'secret' },
+      'curl -sL https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip \\\n  | sha256sum'),
+    el('div', { class: 'row' }, [relaySwitch,
+      el('span', { class: 'muted' }, 'fetch cores for nodes that cannot reach the release')]),
+    el('div', { class: 'muted' },
+      'Nodes always try the official release first. Relaying costs this machine the bandwidth, and changes nothing about trust — the node checks the same checksum either way.'),
+  ], [add]);
+}
 
 // One token per node. A node keeps its token — it is what lets it come back
 // after losing its storage — so revoking one has to end that node's access

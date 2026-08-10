@@ -23,7 +23,9 @@ from .db import Point
 MODES = ("tcp", "tunnel", "status", "download")
 
 
-def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> dict[str, Any]:
+def build_document(point: Point, defaults: Defaults, *, base_url: str = "",
+                   cores: list[dict[str, str]] | None = None,
+                   core_relay: bool = False) -> dict[str, Any]:
     d = defaults
     interval_default = {
         "tcp": d.tcp_interval, "tunnel": d.tunnel_interval,
@@ -98,6 +100,14 @@ def build_document(point: Point, defaults: Defaults, *, base_url: str = "") -> d
         "exit_expectations": point.exit_expectations or d.exit_expectations,
         "jitter": d.jitter,
         "spread": d.spread,
+        # Policy, not payload: which cores exist and what each must hash to.
+        # The probe fetches from a location built into itself and verifies
+        # against this, so the control plane never distributes code — at worst
+        # it can name a different official release.
+        "cores": cores or [],
+        # Whether this service will fetch a core for a node that cannot reach
+        # the release itself. Off unless the owner turned it on.
+        "core_relay": core_relay,
     }
     if point.push_enabled:
         # Metrics go to the control-plane relay, not to the store directly:

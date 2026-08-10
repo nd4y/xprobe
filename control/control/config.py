@@ -119,9 +119,9 @@ class Config:
     # filtered — so the panel needs no per-point structure.
     shared_squad_name: str = "Monitor"
     # Default target set for auto-enrolled nodes: panel host remarks, comma
-    # separated. Every point gets its OWN pair of squads and accounts — a
-    # shared subscription would tie the inbound sets of unrelated points
-    # together, which is exactly what separate sets exist to avoid.
+    # separated. Every point still gets its OWN account in the shared squad —
+    # a shared identity would make it impossible to cut one node off, which
+    # is exactly what per-point accounts exist to allow.
     default_check_remarks: tuple[str, ...] = ()
     default_load_remarks: tuple[str, ...] = ()
     defaults: Defaults = field(default_factory=Defaults)

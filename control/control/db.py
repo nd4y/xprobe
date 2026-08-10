@@ -1,11 +1,11 @@
 """Point storage. SQLite: the fleet is tens of points, not millions.
 
 Only what the control plane itself manages lives here: point names, secret
-hashes, labels, modes, intervals and subscription links. The target set (which
-servers a point checks) lives in the panel — only the uuids of the squads it
-is pinned to are stored. Usage, node status, metrics — not here: those are
-other systems' data, and duplicating them would create a second answer to the
-same question.
+hashes, labels, modes, intervals, subscription links and the target sets
+(which servers each check probes — `targets`). Legacy squad uuids are kept
+solely to migrate points provisioned before the control plane filtered
+configs. Usage, node status, metrics — not here: those are other systems'
+data, and duplicating them would create a second answer to the same question.
 """
 
 from __future__ import annotations
@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS points (
     targets           TEXT NOT NULL DEFAULT '{}',   -- {"tcp":[names],"status":[],"download":[]}
     cores             TEXT NOT NULL DEFAULT '{}',   -- {"status":"v26.7.28",...} per check
     xray_versions     TEXT NOT NULL DEFAULT '[]',   -- what the probe reports it carries
+    last_seen_at      REAL NOT NULL DEFAULT 0,      -- any authenticated call from the probe
+    last_metrics_at   REAL NOT NULL DEFAULT 0,      -- the last sample it delivered
     download_url      TEXT NOT NULL DEFAULT '',     -- volume test source, empty = fleet default
     download_min_bytes INTEGER NOT NULL DEFAULT 0,  -- volume that must get through
     exit_expectations TEXT NOT NULL DEFAULT '',     -- json or empty (fleet defaults)
@@ -120,6 +122,11 @@ class Point:
     # image decides, and this is how the UI can warn before a check is set to
     # a version the node does not have.
     xray_versions: list[str] = None  # type: ignore[assignment]
+    # When the probe was last heard from at all, and when it last delivered a
+    # sample. Two clocks because they fail apart: a probe that is standing
+    # down, or whose checks are all off, still polls but sends nothing.
+    last_seen_at: float = 0.0
+    last_metrics_at: float = 0.0
     # Volume-tolerance test settings; empty/0 means the fleet default. Per
     # point because how much a network lets through is a property of that
     # network, not of the fleet.
@@ -162,6 +169,7 @@ class Point:
             "modes": self.modes, "intervals": self.intervals,
             "targets": self.targets, "cores": self.cores,
             "xray_versions": self.xray_versions,
+            "last_seen_at": self.last_seen_at, "last_metrics_at": self.last_metrics_at,
             "download_url": self.download_url,
             "download_min_bytes": self.download_min_bytes,
             "exit_expectations": self.exit_expectations,
@@ -187,6 +195,9 @@ def connect(path: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE points ADD COLUMN cores TEXT NOT NULL DEFAULT '{}'")
     if "xray_versions" not in have:
         conn.execute("ALTER TABLE points ADD COLUMN xray_versions TEXT NOT NULL DEFAULT '[]'")
+    for col in ("last_seen_at", "last_metrics_at"):
+        if col not in have:
+            conn.execute(f"ALTER TABLE points ADD COLUMN {col} REAL NOT NULL DEFAULT 0")
     if "download_min_bytes" not in have:
         conn.execute("ALTER TABLE points ADD COLUMN download_min_bytes INTEGER NOT NULL DEFAULT 0")
     conn.commit()
@@ -223,6 +234,7 @@ def _row_to_point(r: sqlite3.Row) -> Point:
         modes=json.loads(r["modes"] or "{}"), intervals=json.loads(r["intervals"] or "{}"),
         targets=json.loads(r["targets"] or "{}"), cores=json.loads(r["cores"] or "{}"),
         xray_versions=json.loads(r["xray_versions"] or "[]"),
+        last_seen_at=r["last_seen_at"], last_metrics_at=r["last_metrics_at"],
         download_url=r["download_url"], download_min_bytes=r["download_min_bytes"],
         exit_expectations=json.loads(r["exit_expectations"]) if r["exit_expectations"] else None,
         push_enabled=bool(r["push_enabled"]), enabled=bool(r["enabled"]),
@@ -318,6 +330,18 @@ def delete_point(conn: sqlite3.Connection, name: str) -> bool:
     cur = conn.execute("DELETE FROM points WHERE name = ?", (name,))
     conn.commit()
     return cur.rowcount > 0
+
+
+def touch_point(conn: sqlite3.Connection, name: str, *, metrics: bool = False) -> None:
+    """Record that the probe was heard from. Does NOT bump the version — the
+    point has not changed, we merely learned it is alive."""
+    now = time.time()
+    if metrics:
+        conn.execute("UPDATE points SET last_seen_at = ?, last_metrics_at = ? WHERE name = ?",
+                     (now, now, name))
+    else:
+        conn.execute("UPDATE points SET last_seen_at = ? WHERE name = ?", (now, name))
+    conn.commit()
 
 
 def update_xray_versions(conn: sqlite3.Connection, name: str, versions: list[str]) -> None:

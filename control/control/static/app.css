@@ -76,6 +76,8 @@ h3 { margin: 0; font-size: 15px; font-weight: 600; }
 .chip.on { color: var(--ok); border-color: transparent; background: var(--ok-container); }
 .chip.off { color: var(--off); }
 .chip.tonal { background: var(--sec-container); color: var(--on-sec-container); border-color: transparent; }
+/* late: worth a look, not yet a failure */
+.chip.warnchip { color: var(--danger); border-color: var(--danger); }
 
 /* ── buttons ── */
 button {

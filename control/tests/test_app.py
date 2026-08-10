@@ -135,6 +135,123 @@ def test_a_disabled_point_is_told_to_stand_down(tmp_path):
     assert r.json()["enabled"] is False
 
 
+def test_liveness_follows_the_point_s_own_cadence(tmp_path):
+    # A fixed threshold would call every point on a slower schedule late, so
+    # the expectation comes from what this point was told to do.
+    points, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c"), "sec")
+
+    fresh = admin.get("/api/admin/points/yar", cookies=owner_cookie()).json()
+    assert fresh["health"]["state"] == "never"      # nothing has been heard yet
+
+    points.get("/api/points/yar/config", headers=basic("yar", "sec"))
+    seen = admin.get("/api/admin/points/yar", cookies=owner_cookie()).json()["health"]
+    # Heard from, but it has delivered nothing — that is not "online".
+    assert seen["state"] == "no metrics"
+    assert seen["seen_ago"] < 5
+
+    points.post("/api/points/yar/metrics", headers=basic("yar", "sec"), content=b"x 1\n")
+    live = admin.get("/api/admin/points/yar", cookies=owner_cookie()).json()["health"]
+    assert live["state"] == "online"
+    assert live["expect_every"] == Defaults().push_interval
+
+
+def test_a_point_that_owes_no_metrics_is_not_called_dead(tmp_path):
+    # Every check off, or the point disabled: it keeps polling and sends
+    # nothing. Calling that offline would train the operator to ignore the
+    # field.
+    points, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", modes={"tcp": False, "tunnel": False,
+                                                           "status": False, "download": False}),
+                    "sec")
+    points.get("/api/points/yar/config", headers=basic("yar", "sec"))
+    h = admin.get("/api/admin/points/yar", cookies=owner_cookie()).json()["health"]
+    assert h["state"] == "standing by"
+    assert h["expects_metrics"] is False
+
+
+def test_a_version_that_is_not_a_plain_tag_never_enters_the_catalogue(tmp_path):
+    # On the node a version is a path component under the core cache. With
+    # relaying on, "../.." would let the control plane choose where the file
+    # lands — the exact reach the fixed download URL exists to deny.
+    _, admin, _ = build(tmp_path)
+    for bad in ("../evil", "v1/..", "a\\b", ".hidden", ""):
+        r = admin.post("/api/admin/cores", cookies=owner_cookie(),
+                       json={"version": bad, "sha256": "a" * 64})
+        assert r.status_code == 400, bad
+
+
+def test_malformed_edit_payloads_are_rejected_at_the_door(tmp_path):
+    # A wrong-shaped value would not fail on the PATCH — it would fail later,
+    # as a 500 on every document build for this point.
+    _, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar"), "sec")
+    for bad in ({"modes": "tcp"}, {"modes": {"tcp": "yes"}},
+                {"intervals": {"tcp": "fast"}}, {"cores": {"status": 1}},
+                {"targets": {"tcp": "RU · TLS"}}):
+        r = admin.patch("/api/admin/points/yar", cookies=owner_cookie(), json=bad)
+        assert r.status_code == 400, bad
+    # A string instead of a list would be exploded into letters by set().
+    r = admin.post("/api/admin/points/yar/set", cookies=owner_cookie(),
+                   json={"tcp_remarks": "RU · TLS"})
+    assert r.status_code == 400
+    assert db.get_point(deps.conn, "yar").version == 1     # nothing was written
+
+
+def test_enroll_slug_stays_ascii(tmp_path):
+    # The slug becomes a point name and a panel username; a city reported in
+    # another alphabet must fall through, not produce a name the panel rejects.
+    points, admin, deps = build(tmp_path)
+    tok = _issue(admin, label="")["token"]
+    r = points.post("/api/enroll", json={"token": tok, "node_id": "n1",
+                                         "geo": {"city": "Ярославль"}})
+    assert r.status_code == 200
+    name = r.json()["point"]
+    assert name.isascii()
+    assert db.get_point(deps.conn, name) is not None
+
+
+def test_core_catalogue_requires_a_checksum(tmp_path):
+    # The checksum is the only reason fetching a binary is safe at all, so a
+    # version without one cannot enter the catalogue.
+    _, admin, _ = build(tmp_path)
+    bad = admin.post("/api/admin/cores", cookies=owner_cookie(),
+                     json={"version": "v26.7.28", "sha256": "nope"})
+    assert bad.status_code == 400
+    good = admin.post("/api/admin/cores", cookies=owner_cookie(),
+                      json={"version": "v26.7.28", "sha256": "a" * 64})
+    assert good.status_code == 200
+    listed = admin.get("/api/admin/cores", cookies=owner_cookie()).json()
+    assert listed["cores"] == [{"version": "v26.7.28", "sha256": "a" * 64}]
+    assert listed["relay"] is False        # off unless the owner turns it on
+
+
+def test_the_document_carries_the_catalogue_not_a_location(tmp_path):
+    # The download location lives in the probe. If the control plane could
+    # name one, it could point the fleet anywhere.
+    points, admin, deps = build(tmp_path)
+    admin.post("/api/admin/cores", cookies=owner_cookie(),
+               json={"version": "v26.7.28", "sha256": "b" * 64})
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c"), "sec")
+    doc = points.get("/api/points/yar/config", headers=basic("yar", "sec")).json()
+    assert doc["cores"] == [{"version": "v26.7.28", "sha256": "b" * 64}]
+    assert "http" not in json.dumps(doc["cores"])
+
+
+def test_core_relay_is_refused_until_it_is_enabled(tmp_path):
+    points, admin, deps = build(tmp_path)
+    admin.post("/api/admin/cores", cookies=owner_cookie(),
+               json={"version": "v26.7.28", "sha256": "c" * 64})
+    db.create_point(deps.conn, db.Point(name="yar"), "sec")
+    r = points.get("/api/points/yar/core/v26.7.28", headers=basic("yar", "sec"))
+    assert r.status_code == 403
+    admin.post("/api/admin/cores/relay", cookies=owner_cookie(), json={"enabled": True})
+    # Now allowed through the gate — and refused by the catalogue for an
+    # unknown version rather than fetched blindly.
+    assert points.get("/api/points/yar/core/v1.2.3",
+                      headers=basic("yar", "sec")).status_code == 404
+
+
 def test_a_disabled_point_cannot_push_metrics(tmp_path):
     # Takes effect on the next sample rather than the next poll — a probe that
     # has not yet asked is still pushing.
