@@ -19,30 +19,43 @@ Second: **exit-address verification**. A WARP failure is masked by the
 checker stays green. The only way to see it is the address the traffic
 actually left from.
 
-## Three modes, concurrently
+## Four modes, concurrently
 
-All run in one process, each in its own thread, with separate subscriptions,
-intervals, timeouts and port ranges:
+All run in one process, each in its own thread, with separate target sets,
+intervals, timeouts, port ranges — and cores:
 
-| Mode | What it does | Interval | Target set |
+| Mode | What it does | Core | Interval |
 |---|---|---|---|
-| `tcp` | TCP connect and TLS handshake to the inbound, no Xray | 300 s | its own |
-| `status` (shown as **http** in the UI) | HTTP request through the config | 300 s | its own |
-| `download` | downloads a file, measures volume and speed | 1800 s | its own — keep it short |
+| `tcp` | TCP connect and TLS handshake **to the inbound** | none | 300 s |
+| `tunnel` | TLS handshake **through the tunnel** a core builds | yes | 300 s |
+| `status` (shown as **http** in the UI) | HTTP request through the config | yes | 300 s |
+| `download` | pulls a volume through the tunnel | yes | 1800 s |
 
-`tcp` and `status` share a schedule and run concurrently, so a failing stage
-is always compared against a same-age result from the stage below it. Each
-mode has an independent target set: the cheap checks can cover everything
-while the bandwidth check stays on a couple of configs.
+The cheap checks share a schedule and run concurrently, so a failing stage is
+always compared against a same-age result from the stage below it. Each mode
+has an independent target set: the cheap checks can cover everything while the
+bandwidth check stays on a couple of configs.
 
-The three modes answer different questions, and together they show **at which
-stage** things broke:
+Together they show **at which stage** things broke:
 
 * `tcp` red — the inbound is unreachable: network, routing, address blocking;
 * `tcp` green, `tls_ok` red — the handshake is being cut, most likely by SNI;
-* both green, `status` red — the endpoint is alive but the protocol itself
-  fails (client/server mismatch, inbound down, credential invalid);
+* `tcp` green, `tunnel` red — the entry is reachable but the tunnel does not
+  work: a credential, a protocol, or a core that handles this config
+  differently;
+* `tunnel` green, `status` red — the tunnel carries traffic but the request
+  does not survive the round trip;
 * everything green, `download` red — the channel exists but collapses under load.
+
+`tcp` and `tunnel` differ in exactly one thing — whether a core is in the
+path — which is what makes the pair diagnostic, and why `tcp` never takes a
+core version while `tunnel` does.
+
+The `tunnel` check completes a **TLS handshake through** the tunnel rather
+than merely opening it: a core answers a SOCKS connect before it dials
+anything, so a broken config yields a socket in about a millisecond and looks
+perfect. Verified against a config with a corrupted credential — `tcp` stays
+green, `tunnel` turns red.
 
 Separate subscriptions exist because the sets differ: the bandwidth check
 downloads through **every** config it has, and keeping its set short is

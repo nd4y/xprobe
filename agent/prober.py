@@ -71,6 +71,17 @@ XRAY = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
 # host.
 XRAY_DIR = os.environ.get("XRAY_DIR", "/opt/xray")
 
+# The checks, cheapest first. Each answers a different question, and the
+# ladder is what turns "it is broken" into "it broke here":
+#   tcp     — the inbound answers and TLS completes, measured WITHOUT a core;
+#   tunnel  — a core can actually establish the tunnel with this config;
+#   status  — a request survives the round trip through it;
+#   download— the tunnel passes volume before something cuts it.
+# tcp and tunnel differ in exactly one thing: whether a core is in the path.
+# Comparing them across core versions is how an implementation change in, say,
+# REALITY shows up as something other than a mystery.
+MODES = ("tcp", "tunnel", "status", "download")
+
 
 def xray_versions() -> dict[str, str]:
     """Cores available in this image: version -> path."""
@@ -255,6 +266,8 @@ class Config:
         """
         defaults = {
             "tcp": {"interval": 300, "timeout": 10, "start_port": 0},
+            "tunnel": {"interval": 300, "timeout": 20, "start_port": 21000,
+                       "url": "http://cp.cloudflare.com/generate_204"},
             "status": {"interval": 300, "timeout": 30, "start_port": 20000,
                        "url": "http://cp.cloudflare.com/generate_204"},
             "download": {"interval": 1800, "timeout": 60, "start_port": 20500,
@@ -264,7 +277,7 @@ class Config:
         sub_interval = int(doc.get("subscription_interval") or 300)
         auth = (point, push_password) if point else None
         probes: list[Probe] = []
-        for kind in ("tcp", "status", "download"):
+        for kind in MODES:
             spec = (doc.get("probes") or {}).get(kind) or {}
             if not spec.get("enabled", False):
                 continue
@@ -624,6 +637,69 @@ def probe_tcp(entry: dict, probe: Probe, cfg: Config) -> Result:
     return res
 
 
+def probe_tunnel(entry: dict, port: int, probe: Probe, cfg: Config) -> Result:
+    """Can the core establish the tunnel and pass bytes through it?
+
+    A TLS handshake is performed to a fixed host THROUGH the tunnel. Opening
+    the socks connection alone proves nothing: the core answers a CONNECT
+    immediately and only dials the outbound once data flows, so a broken
+    config returns a socket in about a millisecond and looks perfect. The
+    handshake is the cheapest exchange that forces real traffic both ways.
+
+    This is the same question `tcp` asks, with one difference: a core is in
+    the path. Run the two side by side, or one core version against another,
+    and a protocol implementation change stops being a mystery — `tcp` green
+    while `tunnel` is red on one core and green on another says exactly where
+    the problem is.
+    """
+    name = entry.get("remarks") or "?"
+    res = Result(kind=probe.kind, name=name, checked_at=time.time())
+    try:
+        binary = xray_binary(probe.xray_version)
+    except LookupError as exc:
+        res.error = str(exc)
+        return res
+
+    parsed = urllib.parse.urlparse(probe.url or "https://cp.cloudflare.com")
+    host = parsed.hostname or "cp.cloudflare.com"
+    # Always TLS: the handshake is the point, so the port follows from that
+    # rather than from whatever scheme the URL happens to carry.
+    dest = parsed.port if parsed.scheme == "https" and parsed.port else 443
+
+    proc = subprocess.Popen(
+        [binary, "run", "-c", "stdin:"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        with proc.stdin as sink:
+            sink.write(json.dumps(client_config(entry, port)).encode())
+        if not wait_port(port, time.time() + 10):
+            return res
+        started = time.time()
+        try:
+            sock = socks5_open(port, host, dest, probe.timeout)
+        except OSError:
+            return res
+        try:
+            ctx = ssl.create_default_context()
+            sock.settimeout(probe.timeout)
+            with ctx.wrap_socket(sock, server_hostname=host):
+                # Completing this means the tunnel carried a round trip: the
+                # ClientHello went out and a real ServerHello came back.
+                res.latency_ms = (time.time() - started) * 1000
+                res.up = True
+        except (ssl.SSLError, OSError):
+            with contextlib.suppress(OSError):
+                sock.close()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return res
+
+
 def probe_one(entry: dict, port: int, probe: Probe, cfg: Config) -> Result:
     name = entry.get("remarks") or "?"
     res = Result(kind=probe.kind, name=name, checked_at=time.time())
@@ -722,6 +798,8 @@ def run_probe(probe: Probe, state: State, cfg: Config, stop: threading.Event) ->
             entry = entries[n]
             if probe.kind == "tcp":
                 res = probe_tcp(entry, probe, cfg)
+            elif probe.kind == "tunnel":
+                res = probe_tunnel(entry, probe.start_port + n, probe, cfg)
             else:
                 # The port stays tied to the config's index: concurrent modes
                 # must not land on the same port.
@@ -806,7 +884,8 @@ def render(state: State, cfg: Config) -> str:
         out.append(f"xprobe_configs{{{lbl}}} {configs.get(probe.kind, 0)}")
         out.append(f"xprobe_subscription_ok{{{lbl}}} {0 if errors.get(probe.kind) else 1}")
         if probe.kind != "tcp":
-            # tcp runs no core, so reporting one for it would be a lie.
+            # tcp runs no core — that is the point of it — so reporting one
+            # for it would be a lie.
             wanted = probe.xray_version or "default"
             runnable = 1 if (not probe.xray_version or probe.xray_version in available) else 0
             out.append(f'xprobe_check_core{{{lbl},version="{escape(wanted)}"}} 1')
