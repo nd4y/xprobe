@@ -103,10 +103,38 @@ the control plane forwards them to VictoriaMetrics (`XPC_RELAY_WRITE_URL`).
 **Provisioning a new point therefore requires no metrics-infrastructure
 changes at all** — one channel for the whole fleet.
 
-**The control plane keeps no copy of other systems' data.** The target set
-lives in the panel (the DB holds only squad uuids), metrics live in
-VictoriaMetrics. Duplicating them would create a second answer to the same
-question.
+**The control plane keeps no copy of the measurements.** Samples live in
+VictoriaMetrics and nowhere else; the UI shows liveness, not results.
+Duplicating them would create a second answer to the same question.
+
+## The control plane's own metrics
+
+Some facts about the fleet exist only on this side: whether a point has
+been heard from at all, which document version it should be running, and
+whether its checks have anything to probe. A probe cannot report them —
+it reports from inside its own run, and a probe that is down reports
+nothing. The control plane therefore pushes them to the same store, on the
+same cadence as the points (`push_interval`), through the same relay
+target. Nothing on the store side needs to know the control plane exists.
+
+| Series | Meaning |
+|---|---|
+| `xprobe_point_state{point,state}` | `1` for the current liveness state: `never`, `offline`, `standing by`, `idle`, `no metrics`, `late`, `online` |
+| `xprobe_point_enabled{point}` | the point is switched on |
+| `xprobe_point_document_version{point}` | the version the point should be on; compare with the probe's own `xprobe_config_version` |
+| `xprobe_point_seen_timestamp_seconds{point}` / `…_metrics_timestamp_seconds` | the two liveness clocks |
+| `xprobe_point_targets{point,probe}` / `…_served_configs` / `…_missing_targets` | how many hosts a check was asked to probe, how many it was actually given, and how many its account cannot see |
+
+The same text is available at `GET /metrics` on the admin port (admin
+credentials) for setups that prefer to scrape.
+
+**`idle` is a warning, not a resting state.** It means every enabled check
+was handed zero configs — an empty target set, or one whose every name is
+absent from the point's subscription. By its clocks alone such a point is
+"online": it is up and pushing its own gauges. That reading is exactly the
+one an operator must not see next to a point that measures nothing, which
+is why the state exists. A single idle check on an otherwise working point
+is listed in `health.idle` and marked in the UI.
 
 ## Explicit binding (without enroll)
 

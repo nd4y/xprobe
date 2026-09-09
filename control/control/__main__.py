@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+from collections.abc import Callable
 
 import uvicorn
 
@@ -27,7 +28,7 @@ class _Server(uvicorn.Server):
         pass
 
 
-def build() -> tuple[uvicorn.Server, uvicorn.Server]:
+def build() -> tuple[tuple[uvicorn.Server, uvicorn.Server], Callable[[], bool], int]:
     cfg = Config.load()
     oidc = None
     if cfg.oidc is not None:
@@ -36,14 +37,32 @@ def build() -> tuple[uvicorn.Server, uvicorn.Server]:
     points, admin = create_apps(Deps(cfg, oidc=oidc))
     points_port = int(os.environ.get("XPC_POINTS_PORT", "8080"))
     admin_port = int(os.environ.get("XPC_ADMIN_PORT", "8081"))
-    return (
+    servers = (
         _Server(uvicorn.Config(points, host="0.0.0.0", port=points_port)),
         _Server(uvicorn.Config(admin, host="0.0.0.0", port=admin_port)),
     )
+    return servers, admin.state.push_fleet_metrics, cfg.defaults.push_interval
+
+
+async def push_fleet(push: Callable[[], bool], every: int,
+                     servers: tuple[uvicorn.Server, ...]) -> None:
+    """The fleet's state goes to the store on the probes' own cadence.
+
+    The same period as a point's push, so one liveness rule reads both: a
+    point that fell silent and a control plane that did look alike in the
+    store, and both deserve the alert.
+    """
+    while not any(s.should_exit for s in servers):
+        # The relay call blocks; off the loop so the servers keep serving.
+        await asyncio.to_thread(push)
+        for _ in range(every):
+            if any(s.should_exit for s in servers):
+                return
+            await asyncio.sleep(1)
 
 
 async def serve() -> None:
-    servers = build()
+    servers, push, every = build()
 
     def stop(*_args) -> None:
         for s in servers:
@@ -56,7 +75,7 @@ async def serve() -> None:
         except NotImplementedError:  # Windows during local development
             signal.signal(sig, stop)
 
-    await asyncio.gather(*(s.serve() for s in servers))
+    await asyncio.gather(*(s.serve() for s in servers), push_fleet(push, every, servers))
 
 
 if __name__ == "__main__":
