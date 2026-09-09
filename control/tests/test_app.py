@@ -679,3 +679,64 @@ def test_pinned_geo_is_not_overridden_by_reports(tmp_path):
     p = db.get_point(deps.conn, "yar")
     assert p.city == "Tolyatti"        # pinned by the administrator — reports do not touch it
     assert p.ip == "5.6.7.8"           # the ip is still updated
+
+
+# ── idle points and the control plane's own metrics ───────────────────────────
+
+
+def test_a_point_with_nothing_to_check_is_idle_not_online(tmp_path):
+    # Caught in production: a point whose target sets were never filled ran
+    # for a month as "online" — up, pushing its own gauges, probing nothing.
+    points, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c",
+                                        targets={"tcp": [], "status": [], "download": []}),
+                    "sec")
+    points.get("/api/points/yar/config", headers=basic("yar", "sec"))
+    points.get("/api/points/yar/configs/tcp", headers=basic("yar", "sec"))
+    points.post("/api/points/yar/metrics", headers=basic("yar", "sec"), content=b"x 1\n")
+    h = admin.get("/api/admin/points/yar", cookies=owner_cookie()).json()["health"]
+    assert h["state"] == "idle"
+    assert set(h["idle"]) == {"tcp", "status", "download"}
+
+
+def test_a_check_served_nothing_is_idle_while_the_point_stays_online(tmp_path):
+    # Judged by what was handed out, not by the list: a set whose every name
+    # is absent from the subscription is served as nothing too.
+    points, admin, deps = build(tmp_path)
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c",
+                                        modes={"tcp": True, "download": True},
+                                        targets={"tcp": ["RU · TLS"], "download": ["ghost"]}),
+                    "sec")
+    points.get("/api/points/yar/config", headers=basic("yar", "sec"))
+    assert len(points.get("/api/points/yar/configs/tcp", headers=basic("yar", "sec")).json()) == 1
+    assert points.get("/api/points/yar/configs/download", headers=basic("yar", "sec")).json() == []
+    points.post("/api/points/yar/metrics", headers=basic("yar", "sec"), content=b"x 1\n")
+    h = admin.get("/api/admin/points/yar", cookies=owner_cookie()).json()["health"]
+    assert h["state"] == "online"
+    assert h["idle"] == ["download"]
+
+
+def test_the_fleet_s_state_reaches_the_store_like_a_probe_s_samples_do(tmp_path):
+    # A probe that is down reports nothing, so "never heard from" and "on a
+    # stale document" can only come from this side — and they go to the
+    # same store, so one dashboard sees the fleet.
+    captured: list[bytes] = []
+    points, admin, deps = build(tmp_path, relay_capture=captured)
+    db.create_point(deps.conn, db.Point(name="yar", check_sub_url="https://s/c",
+                                        targets={"tcp": ["RU · TLS"]}), "sec")
+    assert admin.app.state.push_fleet_metrics() is True
+    body = captured[-1].decode()
+    assert 'xprobe_point_state{point="yar",state="never"} 1' in body
+    assert 'xprobe_point_state{point="yar",state="online"} 0' in body
+    assert 'xprobe_point_document_version{point="yar"} 1' in body
+    assert 'xprobe_point_targets{point="yar",probe="tcp"} 1' in body
+    # Nothing served yet — no claim about it.
+    assert "xprobe_point_served_configs{" not in body
+
+    points.get("/api/points/yar/configs/tcp", headers=basic("yar", "sec"))
+    scraped = admin.get("/metrics", cookies=owner_cookie())
+    assert scraped.status_code == 200
+    assert 'xprobe_point_served_configs{point="yar",probe="tcp"} 1' in scraped.text
+    assert 'xprobe_point_state{point="yar",state="no metrics"} 1' in scraped.text
+    # The same door as the rest of the admin API.
+    assert admin.get("/metrics").status_code == 401

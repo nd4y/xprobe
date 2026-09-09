@@ -68,6 +68,10 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
     # (point, check) -> targets the account's subscription does not contain.
     # Filled when configs are served; surfaced in the point's admin view.
     _missing_targets: dict[tuple[str, str], list[str]] = {}
+    # (point, check) -> how many configs the check was last given. Zero is
+    # the case worth remembering: the probe then runs, pushes, and looks
+    # alive while checking nothing at all.
+    _served: dict[tuple[str, str], int] = {}
     # Release archives already fetched for relaying, kept so a fleet coming up
     # at once costs one download rather than one per node.
     _core_blobs: dict[str, bytes] = {}
@@ -227,6 +231,8 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             raise HTTPException(404, "point is disabled")
         if not p.check_sub_url:
             raise HTTPException(409, "the point has no subscription yet")
+        # Contact is contact: a probe polling for configs has been heard from.
+        db.touch_point(deps.conn, p.name)
         wanted = set(_targets_of(p).get(kind) or [])
         try:
             configs = _subscription(p)
@@ -238,6 +244,7 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         # loudly, and remember it for the UI.
         missing = sorted(wanted - {c.get("remarks") for c in configs})
         _missing_targets[(p.name, kind)] = missing
+        _served[(p.name, kind)] = len(chosen)
         if missing:
             log.warning("point %s / %s: %d target(s) absent from its subscription: %s",
                         p.name, kind, len(missing), ", ".join(missing))
@@ -769,6 +776,7 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         seen_ago = now - p.last_seen_at if p.last_seen_at else None
         metrics_ago = now - p.last_metrics_at if p.last_metrics_at else None
         expects_metrics = p.enabled and p.push_enabled and any(p.modes.values())
+        idle = _idle_checks(p)
 
         if seen_ago is None:
             state = "never"
@@ -776,6 +784,12 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
             state = "offline"
         elif not expects_metrics:
             state = "standing by"
+        elif idle and len(idle) == sum(1 for on in p.modes.values() if on):
+            # Every enabled check has nothing to probe. The probe is up and
+            # pushing (its own gauges, with zero configs), so by the clocks
+            # alone this would be "online" — the one reading that must not
+            # be shown for a point that measures nothing.
+            state = "idle"
         elif metrics_ago is None or metrics_ago > 5 * every:
             state = "no metrics"
         elif metrics_ago > 2 * every or seen_ago > 2 * every:
@@ -783,7 +797,109 @@ def create_apps(deps: Deps) -> tuple[FastAPI, FastAPI]:
         else:
             state = "online"
         return {"state": state, "seen_ago": seen_ago, "metrics_ago": metrics_ago,
-                "expect_every": every, "expects_metrics": expects_metrics}
+                "expect_every": every, "expects_metrics": expects_metrics, "idle": idle}
+
+    def _idle_checks(p: db.Point) -> list[str]:
+        """Enabled checks that have nothing to probe.
+
+        Judged by what the control plane last handed out, not by the target
+        list: a set whose every name is absent from the subscription is served
+        as nothing too. Before the first request the stored set is the best
+        available guess; a legacy point (targets still in the panel) is left
+        alone rather than guessed at.
+        """
+        out = []
+        for kind in MODES:
+            if not p.modes.get(kind):
+                continue
+            served = _served.get((p.name, kind))
+            if served is None:
+                if not p.targets:
+                    continue
+                served = len(p.targets.get(kind) or [])
+            if served == 0:
+                out.append(kind)
+        return out
+
+    # ── the control plane's own metrics ─────────────────────────────────────
+
+    STATES = ("never", "offline", "standing by", "idle", "no metrics", "late", "online")
+
+    def fleet_metrics() -> str:
+        """What the control plane knows and the store does not.
+
+        A probe reports only from inside its own run; whether a point is
+        heard from at all, which document it should be on, and whether it
+        has anything to check are facts this side holds. Exposed in the
+        same format the probes use, so a dashboard and an alert rule can
+        see the fleet in one place — the store — rather than in this UI.
+        """
+        out = [
+            "# HELP xprobe_point_state liveness as the control plane sees it; 1 for the current",
+            "# TYPE xprobe_point_state gauge",
+            "# HELP xprobe_point_enabled 1 — the point is enabled",
+            "# TYPE xprobe_point_enabled gauge",
+            "# HELP xprobe_point_document_version version of the document the point should run",
+            "# TYPE xprobe_point_document_version gauge",
+            "# HELP xprobe_point_seen_timestamp_seconds when the point was last heard from at all",
+            "# TYPE xprobe_point_seen_timestamp_seconds gauge",
+            "# HELP xprobe_point_metrics_timestamp_seconds when the point last delivered a sample",
+            "# TYPE xprobe_point_metrics_timestamp_seconds gauge",
+            "# HELP xprobe_point_targets hosts in the check's target set",
+            "# TYPE xprobe_point_targets gauge",
+            "# HELP xprobe_point_served_configs configs the check was last given",
+            "# TYPE xprobe_point_served_configs gauge",
+            "# HELP xprobe_point_missing_targets targets absent from the point's subscription",
+            "# TYPE xprobe_point_missing_targets gauge",
+        ]
+        for p in db.list_points(deps.conn):
+            h = _health(p)
+            lbl = f'point="{p.name}"'
+            for s in STATES:
+                out.append(f'xprobe_point_state{{{lbl},state="{s}"}} {1 if h["state"] == s else 0}')
+            out.append(f"xprobe_point_enabled{{{lbl}}} {1 if p.enabled else 0}")
+            out.append(f"xprobe_point_document_version{{{lbl}}} {p.version}")
+            seen, delivered = p.last_seen_at or 0, p.last_metrics_at or 0
+            out.append(f"xprobe_point_seen_timestamp_seconds{{{lbl}}} {seen:.0f}")
+            out.append(f"xprobe_point_metrics_timestamp_seconds{{{lbl}}} {delivered:.0f}")
+            for kind in MODES:
+                klbl = f'{lbl},probe="{kind}"'
+                targets = len((p.targets or {}).get(kind) or [])
+                out.append(f"xprobe_point_targets{{{klbl}}} {targets}")
+                served = _served.get((p.name, kind))
+                if served is not None:
+                    out.append(f"xprobe_point_served_configs{{{klbl}}} {served}")
+                out.append(f"xprobe_point_missing_targets{{{klbl}}} "
+                           f"{len(_missing_targets.get((p.name, kind), []))}")
+        return "\n".join(out) + "\n"
+
+    def push_fleet_metrics() -> bool:
+        """Deliver the fleet's state to the store the way the probes do.
+
+        Through the relay target rather than a scrape: the address is already
+        configured for the probes' sake, and nothing on the store side then
+        needs to know the control plane exists.
+        """
+        if cfg.relay is None:
+            return False
+        auth = (cfg.relay.username, cfg.relay.password) if cfg.relay.username else None
+        try:
+            r = deps.http.post(cfg.relay.write_url, content=fleet_metrics().encode(),
+                               headers={"Content-Type": "text/plain"}, auth=auth)
+        except Exception as exc:  # noqa: BLE001 — network; nothing to do but say so
+            log.warning("fleet metrics not delivered: %s", exc)
+            return False
+        if r.status_code >= 400:
+            log.warning("metrics store rejected fleet metrics: %s", r.status_code)
+            return False
+        return True
+
+    # The entry point runs this on the probes' push cadence; tests call it.
+    admin.state.push_fleet_metrics = push_fleet_metrics
+
+    @admin.get("/metrics")
+    def metrics(_: dict = Depends(require_owner)) -> Response:
+        return Response(fleet_metrics(), media_type="text/plain; version=0.0.4")
 
     def _targets_of(p: db.Point) -> dict[str, list[str]]:
         """The point's target sets, migrating a legacy point on first read.

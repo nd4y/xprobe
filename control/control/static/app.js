@@ -98,13 +98,17 @@ function ago(seconds) {
 // The threshold comes from the backend, derived from this point's own
 // cadence — a point on a slower schedule is not late for being slow.
 const HEALTH_CLASS = {
-  online: 'on', 'standing by': 'tonal', late: 'warnchip',
+  online: 'on', 'standing by': 'tonal', late: 'warnchip', idle: 'warnchip',
   'no metrics': 'off', offline: 'off', never: 'off',
 };
 
 function healthChip(h) {
   if (!h) return null;
   if (h.state === 'never') return chip('never seen', 'off');
+  // Idle: the probe is up and pushing, but every enabled check has nothing
+  // to probe. By the clocks alone it would read "online" — the one word
+  // that must not appear next to a point measuring nothing.
+  if (h.state === 'idle') return chip('idle · nothing to check', 'warnchip');
   const detail = h.state === 'online' || h.state === 'late'
     ? ago(h.metrics_ago ?? h.seen_ago)
     : ago(h.seen_ago);
@@ -289,6 +293,9 @@ async function pointView(name) {
         sw,
         el('span', { class: 'name' }, MODE_LABEL[m]),
         el('span', { class: 'muted grow' }, MODE_HINT[m]),
+        // Enabled, yet served no configs: an empty set, or a set whose every
+        // name is absent from the point's subscription.
+        ...((h.idle || []).includes(m) ? [chip('nothing to check', 'warnchip')] : []),
         el('span', { class: 'every' }, [el('span', { class: 'muted' }, 'every'), iv,
           el('span', { class: 'muted' }, 's')]),
       ];
